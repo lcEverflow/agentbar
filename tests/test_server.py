@@ -143,6 +143,25 @@ def test_quota_refresh_endpoint(api):
     assert code == 202 and j["ok"]
 
 
+def test_debug_dispatch_404_without_menubar(api):
+    srv, s = api
+    code, _ = _call(srv, "/api/debug/dispatch", "POST", s.token,
+                    {"action": "open_panel"})
+    assert code == 404
+
+
+def test_debug_dispatch_routes_to_hook(api):
+    srv, s = api
+    seen = []
+    srv.hooks["dispatch"] = seen.append
+    code, j = _call(srv, "/api/debug/dispatch", "POST", s.token,
+                    {"action": "open_panel"})
+    assert code == 202 and seen == ["open_panel"]
+    # 白名单外的动作（quit 等）拒绝远程触发
+    code, _ = _call(srv, "/api/debug/dispatch", "POST", s.token, {"action": "quit"})
+    assert code == 400
+
+
 def test_tools_endpoint(api):
     srv, s = api
     code, j = _call(srv, "/api/tools", token=s.token)

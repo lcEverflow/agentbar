@@ -120,6 +120,7 @@ def cmd_run(args, settings: Settings) -> int:
     from .menubar import AgentBarApp  # 延迟 import，headless/测试不依赖 pyobjc
 
     app = AgentBarApp(core, settings, server)
+    server.hooks["dispatch"] = app.dispatch_async  # /api/debug/dispatch 通道
 
     def _watch_signal():
         stop_evt.wait()

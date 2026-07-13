@@ -28,10 +28,14 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory,
     NSMenu,
     NSMenuItem,
+    NSPasteboard,
+    NSPasteboardTypeString,
     NSStatusBar,
     NSVariableStatusItemLength,
+    NSWorkspace,
+    NSWorkspaceOpenConfiguration,
 )
-from Foundation import NSObject, NSTimer
+from Foundation import NSObject, NSTimer, NSURL
 from PyObjCTools import AppHelper
 
 from .browser import open_url_async
@@ -100,6 +104,10 @@ class AgentBarApp:
     def stop_from_thread(self) -> None:
         """信号处理线程调用：清理已在外部完成，只负责停掉主事件循环。"""
         AppHelper.callAfter(self._terminate)
+
+    def dispatch_async(self, action: str) -> None:
+        """任意线程安全：把动作转投主线程，与真实菜单点击走同一 _dispatch。"""
+        AppHelper.callAfter(self._dispatch, action)
 
     def _terminate(self) -> None:
         self._nsapp.terminate_(None)
@@ -177,8 +185,49 @@ class AgentBarApp:
         self._update_title()
 
     def _open(self, url: str) -> None:
-        if not open_url_async(url):
-            self._alert("无法打开浏览器", f"请手动打开：\n{url}")
+        """打开面板：NSWorkspace 原生异步优先（无子进程），失败绝不静默。"""
+        if self._open_native(url):
+            return
+        if not open_url_async(url, on_result=self._on_open_result):
+            self._open_failed(url, "无法启动 /usr/bin/open")
+
+    def _open_native(self, url: str) -> bool:
+        try:
+            ns_url = NSURL.URLWithString_(url)
+            cfg = NSWorkspaceOpenConfiguration.configuration()
+
+            def done(app, err):
+                if err is not None:
+                    reason = str(err.localizedDescription())
+                    log.warning("NSWorkspace open failed: %s", reason)
+                    AppHelper.callAfter(self._open_failed, url, reason)
+                else:
+                    log.info("NSWorkspace opened panel ok")
+
+            NSWorkspace.sharedWorkspace().openURL_configuration_completionHandler_(
+                ns_url, cfg, done
+            )
+            return True
+        except Exception:
+            log.exception("NSWorkspace path unavailable, fallback to /usr/bin/open")
+            return False
+
+    def _on_open_result(self, url: str, rc: int, err: str) -> None:
+        """open_url_async 的后台回调（非主线程）。"""
+        if rc != 0:
+            AppHelper.callAfter(self._open_failed, url, f"open 退出码 {rc} {err[:120]}")
+
+    def _open_failed(self, url: str, reason: str) -> None:
+        copied = False
+        try:
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(url, NSPasteboardTypeString)
+            copied = True
+        except Exception:
+            log.exception("pasteboard write failed")
+        hint = "面板地址已复制到剪贴板，直接粘贴到浏览器即可。" if copied else ""
+        self._alert("无法自动打开浏览器", f"原因：{reason}\n{hint}\n{url}")
 
     def _authorize_keychain_bg(self) -> None:
         def work():

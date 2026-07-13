@@ -47,8 +47,10 @@ def _app():
 def test_open_panel_dispatch_is_nonblocking(monkeypatch):
     app = _app()
     opened = []
+    # 测试里禁用 NSWorkspace 真打开，强制走可捕获的 open_url_async 降级路径
+    monkeypatch.setattr(AgentBarApp, "_open_native", lambda self, url: False)
     monkeypatch.setattr("agentbar.menubar.open_url_async",
-                        lambda url: opened.append(url) or True)
+                        lambda url, on_result=None: opened.append(url) or True)
     start = time.monotonic()
     app._dispatch("open_panel")
     assert time.monotonic() - start < 0.05, "菜单动作必须毫秒级返回"
@@ -58,8 +60,9 @@ def test_open_panel_dispatch_is_nonblocking(monkeypatch):
 def test_quick_add_opens_editable_claude_panel(monkeypatch):
     app = _app()
     opened = []
+    monkeypatch.setattr(AgentBarApp, "_open_native", lambda self, url: False)
     monkeypatch.setattr("agentbar.menubar.open_url_async",
-                        lambda url: opened.append(url) or True)
+                        lambda url, on_result=None: opened.append(url) or True)
     app._dispatch("quick_add")
     assert opened == ["http://127.0.0.1:8737/?token=abc&focus=prompt&tool=claude"]
 

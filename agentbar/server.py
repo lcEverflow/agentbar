@@ -28,7 +28,9 @@ class ApiServer:
     def __init__(self, core: Scheduler, settings: Settings):
         self.core = core
         self.settings = settings
-        handler = _make_handler(core, settings)
+        # menu bar 进程注入：把 action 转发到主线程菜单分发器（调试/远程触发用）
+        self.hooks: dict = {"dispatch": None}
+        handler = _make_handler(core, settings, self.hooks)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", settings.port), handler)
         self.httpd.daemon_threads = True
         self._thread: threading.Thread | None = None
@@ -68,7 +70,8 @@ def _load_index_html() -> str:
     )
 
 
-def _make_handler(core: Scheduler, settings: Settings):
+def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None):
+    hooks = hooks if hooks is not None else {}
     class Handler(BaseHTTPRequestHandler):
         server_version = f"AgentBar/{__version__}"
 
@@ -194,6 +197,21 @@ def _make_handler(core: Scheduler, settings: Settings):
                     "ok": ok,
                     "message": "Claude Keychain 已授权并刷新" if ok else "未取得 Claude Keychain 授权",
                 })
+                return
+            if path == "/api/debug/dispatch":
+                # 触发与真实菜单点击完全相同的 _dispatch 路径（主线程执行），
+                # 用于无 GUI 交互的端到端验证。白名单限定只读性动作。
+                fn = hooks.get("dispatch")
+                action = str(body.get("action") or "")
+                if fn is None:
+                    self._json(404, {"ok": False,
+                                     "error": "menu bar 未运行（headless 无此通道）"})
+                    return
+                if action not in {"open_panel", "quick_add", "refresh_quota"}:
+                    self._json(400, {"ok": False, "error": f"action 不在白名单: {action!r}"})
+                    return
+                fn(action)
+                self._json(202, {"ok": True, "action": action})
                 return
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"]:
