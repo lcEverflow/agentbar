@@ -20,6 +20,9 @@ cat > "$PLIST" <<EOF
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$LABEL</string>
+  <!-- 经 uv 启动而非直连 .venv：launchd 上下文对 ~/Documents 有 TCC 限制，
+       直接执行 Documents 下的 venv python 会在读 pyvenv.cfg 时 EPERM；
+       uv（签名二进制，位于用户 bin）实测可正常引导。 -->
   <key>ProgramArguments</key>
   <array>
     <string>$UV_BIN</string>

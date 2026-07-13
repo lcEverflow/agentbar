@@ -44,27 +44,28 @@ def _app():
     return AgentBarApp(_FakeCore(), settings=None, server=_FakeServer())
 
 
-def test_open_panel_dispatch_is_nonblocking(monkeypatch):
+def test_open_panel_opens_native_window(monkeypatch):
+    """open_panel / quick_add 走原生窗口（不再依赖浏览器），且毫秒级返回。"""
+    app = _app()
+    shown = []
+    monkeypatch.setattr(AgentBarApp, "_show_panel",
+                        lambda self, focus: shown.append(focus))
+    start = time.monotonic()
+    app._dispatch("open_panel")
+    app._dispatch("quick_add")
+    assert time.monotonic() - start < 0.05, "菜单动作必须毫秒级返回"
+    assert shown == [False, True]  # quick_add 聚焦 prompt 输入框
+
+
+def test_web_panel_fallback_uses_browser(monkeypatch):
     app = _app()
     opened = []
     # 测试里禁用 NSWorkspace 真打开，强制走可捕获的 open_url_async 降级路径
     monkeypatch.setattr(AgentBarApp, "_open_native", lambda self, url: False)
     monkeypatch.setattr("agentbar.menubar.open_url_async",
                         lambda url, on_result=None: opened.append(url) or True)
-    start = time.monotonic()
-    app._dispatch("open_panel")
-    assert time.monotonic() - start < 0.05, "菜单动作必须毫秒级返回"
+    app._dispatch("open_web_panel")
     assert opened == ["http://127.0.0.1:8737/?token=abc"]
-
-
-def test_quick_add_opens_editable_claude_panel(monkeypatch):
-    app = _app()
-    opened = []
-    monkeypatch.setattr(AgentBarApp, "_open_native", lambda self, url: False)
-    monkeypatch.setattr("agentbar.menubar.open_url_async",
-                        lambda url, on_result=None: opened.append(url) or True)
-    app._dispatch("quick_add")
-    assert opened == ["http://127.0.0.1:8737/?token=abc&focus=prompt&tool=claude"]
 
 
 def test_refresh_quota_dispatch_only_sets_event():

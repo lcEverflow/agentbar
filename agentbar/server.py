@@ -207,7 +207,8 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                     self._json(404, {"ok": False,
                                      "error": "menu bar 未运行（headless 无此通道）"})
                     return
-                if action not in {"open_panel", "quick_add", "refresh_quota"}:
+                if action not in {"open_panel", "quick_add", "refresh_quota",
+                                  "open_web_panel"}:
                     self._json(400, {"ok": False, "error": f"action 不在白名单: {action!r}"})
                     return
                 fn(action)

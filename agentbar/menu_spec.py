@@ -131,7 +131,8 @@ def build_menu_spec(snapshot: dict) -> list[dict]:
         rows.append(_sep())
 
     rows.append(_action("↗ 打开任务面板", "open_panel"))
-    rows.append(_action("＋ 快速添加 Claude 任务…", "quick_add"))
+    rows.append(_action("＋ 快速添加任务…", "quick_add"))
+    rows.append(_action("🌐 在浏览器中打开面板", "open_web_panel"))
     rows.append(_sep())
     if snapshot.get("paused"):
         rows.append(_action("▶ 恢复任务派发", "resume_all"))

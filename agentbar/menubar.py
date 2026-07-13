@@ -79,6 +79,7 @@ class AgentBarApp:
         self._item = None
         self._menu = None
         self._timer = None
+        self._panel = None  # 原生任务面板窗口（懒加载）
 
     # ---------- lifecycle ----------
 
@@ -165,11 +166,11 @@ class AgentBarApp:
         log.info("menu action: %s", action)
         try:
             if action == "open_panel":
-                self._open(self.server.url(with_token=True))
+                self._show_panel(False)
             elif action == "quick_add":
-                self._open(
-                    self.server.url(with_token=True, tool="claude", focus="prompt")
-                )
+                self._show_panel(True)
+            elif action == "open_web_panel":
+                self._open(self.server.url(with_token=True))
             elif action == "refresh_quota":
                 self.core.quota.refresh_now()  # 异步：只置事件
             elif action == "authorize_keychain":
@@ -184,8 +185,18 @@ class AgentBarApp:
             log.exception("menu action %s failed", action)
         self._update_title()
 
+    def _show_panel(self, focus_prompt: bool) -> None:
+        """原生任务面板窗口——激活自身窗口是 accessory 进程被允许的，必定前台。"""
+        if self._panel is None:
+            from .panel_window import PanelWindowController
+
+            self._panel = PanelWindowController.alloc().initWithCore_settings_server_(
+                self.core, self.settings, self.server
+            )
+        self._panel.show_(focus_prompt)
+
     def _open(self, url: str) -> None:
-        """打开面板：NSWorkspace 原生异步优先（无子进程），失败绝不静默。"""
+        """浏览器打开（次要入口）：NSWorkspace 原生异步优先，失败绝不静默。"""
         if self._open_native(url):
             return
         if not open_url_async(url, on_result=self._on_open_result):

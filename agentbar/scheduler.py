@@ -310,7 +310,37 @@ class Scheduler:
                     self._wake.set()
                     return True, "已重新入队"
                 return False, f"状态 {s.value} 不可重试"
+            if action in ("move_top", "move_up", "move_down"):
+                return self._reorder_locked(t, action)
             return False, f"未知操作 {action!r}"
+
+    def _reorder_locked(self, t: Task, action: str) -> tuple[bool, str]:
+        """调整排队任务的优先级（仅影响 QUEUED 任务间的相对顺序，FIFO 派发即优先级）。"""
+        if t.state != TaskState.QUEUED:
+            return False, "仅排队中的任务可调整优先级"
+        queued = [
+            tid for tid in self._order
+            if self._tasks[tid].state == TaskState.QUEUED
+        ]
+        i = queued.index(t.id)
+        if action == "move_up" and i > 0:
+            self._swap_order(queued[i], queued[i - 1])
+        elif action == "move_down" and i < len(queued) - 1:
+            self._swap_order(queued[i], queued[i + 1])
+        elif action == "move_top":
+            while i > 0:  # 逐位前移，保持其余任务相对顺序
+                self._swap_order(queued[i], queued[i - 1])
+                queued[i], queued[i - 1] = queued[i - 1], queued[i]
+                i -= 1
+        else:
+            return True, "已在该位置"
+        self._persist_locked()
+        self._wake.set()
+        return True, "已调整优先级"
+
+    def _swap_order(self, a: str, b: str) -> None:
+        ia, ib = self._order.index(a), self._order.index(b)
+        self._order[ia], self._order[ib] = self._order[ib], self._order[ia]
 
     def pause_all(self) -> None:
         with self._lock:

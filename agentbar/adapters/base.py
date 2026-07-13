@@ -106,15 +106,21 @@ class Adapter(ABC):
 
     @staticmethod
     def _login_shell_which(name: str) -> str | None:
-        try:
-            r = subprocess.run(
-                ["/bin/zsh", "-lc", f"command -v {name}"],
-                capture_output=True, text=True, timeout=15,
-            )
-            path = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
-            return path if path and os.path.exists(path) else None
-        except (subprocess.SubprocessError, OSError):
-            return None
+        # launchd 场景 PATH 极简。-lc 只加载 .zprofile；nvm 常在 .zshrc（交互式）
+        # 里初始化，所以再兜底一次 -lic。
+        for flags in ("-lc", "-lic"):
+            try:
+                r = subprocess.run(
+                    ["/bin/zsh", flags, f"command -v {name}"],
+                    capture_output=True, text=True, timeout=15,
+                    stdin=subprocess.DEVNULL,
+                )
+                path = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+                if path and os.path.exists(path):
+                    return path
+            except (subprocess.SubprocessError, OSError):
+                continue
+        return None
 
     def availability(self) -> dict:
         b = self.binary()

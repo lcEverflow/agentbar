@@ -132,6 +132,36 @@ def test_add_task_validation(core, tmp_path):
         core.add_task("OK", tool="fake", cwd="/definitely/not/a/dir")
 
 
+def test_priority_reorder(core, tmp_path):
+    """排队任务可调优先级：move_top / move_up / move_down 只影响 QUEUED 相对顺序。"""
+    core.pause_all()  # 保持排队状态
+    a = core.add_task("OK a", tool="fake", cwd=str(tmp_path))
+    b = core.add_task("OK b", tool="fake", cwd=str(tmp_path))
+    c = core.add_task("OK c", tool="fake", cwd=str(tmp_path))
+
+    def queued_ids():
+        return [t["id"] for t in core.snapshot()["tasks"] if t["state"] == "queued"]
+
+    assert queued_ids() == [a.id, b.id, c.id]
+    ok, _ = core.act(c.id, "move_top")
+    assert ok and queued_ids() == [c.id, a.id, b.id]
+    ok, _ = core.act(a.id, "move_down")
+    assert ok and queued_ids() == [c.id, b.id, a.id]
+    ok, _ = core.act(a.id, "move_up")
+    assert ok and queued_ids() == [c.id, a.id, b.id]
+    # 已在队首继续 move_up：no-op 但不报错
+    ok, _ = core.act(c.id, "move_up")
+    assert ok and queued_ids() == [c.id, a.id, b.id]
+    core.resume_all()
+
+
+def test_reorder_rejected_for_non_queued(core, tmp_path):
+    t = core.add_task("OK", tool="fake", cwd=str(tmp_path))
+    wait_for(lambda: _get(core, t.id)["state"] == "succeeded", desc="done")
+    ok, msg = core.act(t.id, "move_top")
+    assert not ok and "排队" in msg
+
+
 def test_restart_recovers_running_task(settings, tmp_path):
     """模拟崩溃：state.json 里有 RUNNING 任务 → 新调度器把它重新排队并恢复会话。"""
     store = StateStore(settings.state_dir)
