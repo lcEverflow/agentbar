@@ -22,6 +22,19 @@
           font-size:12px; cursor:default; }
   .chip.ok      { color:var(--green); }
   .chip.limited { color:var(--amber); }
+  .sectionHead { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .sectionHead h2 { margin:0; }
+  .quotaGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:10px; }
+  .quotaCard { background:#16191f; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .quotaTitle { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .quotaWindow { display:grid; grid-template-columns:52px 1fr 38px; gap:7px; align-items:center; margin:5px 0; }
+  .meter { height:6px; border-radius:6px; overflow:hidden; background:#2a2f37; }
+  .meter > i { display:block; height:100%; background:var(--blue); border-radius:inherit; }
+  .meter.warn > i { background:var(--amber); }
+  .origin { color:var(--blue); font-size:11px; }
+  .taskChoice { color:var(--dim); font-size:11px; margin-top:2px; }
+  .kind { font-size:11px; padding:1px 6px; border-radius:8px; background:#2a2f37; }
+  .kind.managed { color:var(--blue); background:#173a5e; }
   .spacer { flex:1; }
   button { background:#2a2f37; color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:5px 12px; cursor:pointer; font-size:13px; }
@@ -69,6 +82,7 @@
   <span class="chip" id="quota-claude" title="">Claude: …</span>
   <span class="chip" id="quota-codex" title="">Codex: …</span>
   <div class="spacer"></div>
+  <button id="btnRefreshQuota" title="立即触发真实额度接口刷新">↻ 刷新额度</button>
   <button id="btnPause">⏸ 全部暂停</button>
   <button id="btnResume">▶ 全部恢复</button>
 </header>
@@ -81,28 +95,46 @@
       <div class="row">
         <select id="fTool"></select>
         <input id="fCwd" placeholder="工作目录"/>
+        <input id="fModel" list="modelChoices" placeholder="模型（可选，默认使用 CLI 设置）" style="min-width:220px"/>
+        <datalist id="modelChoices"></datalist>
+        <select id="fEffort" title="推理强度"></select>
         <select id="fProfile">
           <option value="readonly">🔒 只读</option>
           <option value="edits" selected>✏️ 可编辑文件（默认）</option>
           <option value="full">⚠️ 完全权限</option>
         </select>
         <input id="fTitle" placeholder="标题（可选）" style="max-width:200px"/>
-        <button type="submit" class="primary">添加任务</button>
+        <button type="submit" class="primary" id="btnSubmit">添加任务</button>
+        <button type="button" id="btnCancelEdit" style="display:none">取消编辑</button>
       </div>
       <div class="dim" id="profileHint"></div>
+      <div class="dim" id="modelHint"></div>
+      <div class="dim" id="editHint" style="display:none"></div>
     </form>
   </section>
   <section>
+    <div class="sectionHead"><h2>订阅额度</h2><span class="dim">真实接口数据，默认每 120 秒刷新；获取失败会明确显示，不估算或伪造。</span>
+      <div class="spacer"></div><button class="mini" id="btnAuthorizeClaude" style="display:none">授权读取 Claude Keychain…</button></div>
+    <div class="quotaGrid" id="quotaGrid"></div>
+  </section>
+  <section>
     <h2>进行中 / 队列</h2>
-    <table><thead><tr><th>状态</th><th>任务</th><th>工具</th><th>目录</th><th>说明</th><th></th></tr></thead>
+    <table><thead><tr><th>状态</th><th>任务</th><th>工具 / 模型</th><th>目录</th><th>说明</th><th></th></tr></thead>
     <tbody id="activeBody"></tbody></table>
     <div class="dim" id="activeEmpty">暂无任务</div>
   </section>
   <section>
     <h2>历史记录</h2>
-    <table><thead><tr><th>状态</th><th>任务</th><th>工具</th><th>耗时</th><th>费用</th><th>说明</th><th></th></tr></thead>
+    <table><thead><tr><th>状态</th><th>任务</th><th>工具 / 模型</th><th>耗时</th><th>费用</th><th>说明</th><th></th></tr></thead>
     <tbody id="historyBody"></tbody></table>
     <div class="dim" id="historyEmpty">暂无历史</div>
+  </section>
+  <section>
+    <h2>本机正在运行的 AI CLI</h2>
+    <table><thead><tr><th>工具</th><th>来源</th><th>PID</th><th>状态</th><th>已运行</th><th>工作目录</th><th>任务</th></tr></thead>
+    <tbody id="processBody"></tbody></table>
+    <div class="dim" id="processEmpty">未发现 Claude / Codex CLI 进程</div>
+    <div class="dim">外部任务只读展示进程元数据（不读取 Prompt 或完整命令，也不会被 AgentBar 终止）。</div>
   </section>
   <footer id="settingsLine"></footer>
 </main>
@@ -118,11 +150,13 @@
 <script>
 const $ = id => document.getElementById(id);
 // ---- token：来自 URL ?token=（菜单栏/CLI 打开时携带），存 localStorage ----
-(() => {
+const OPEN_REQUEST = (() => {
   const u = new URL(location.href);
   const t = u.searchParams.get("token");
+  const request = { tool: u.searchParams.get("tool"), focus: u.searchParams.get("focus") };
   if (t) { localStorage.setItem("agentbar_token", t);
            u.searchParams.delete("token"); history.replaceState(null, "", u); }
+  return request;
 })();
 const TOKEN = () => localStorage.getItem("agentbar_token") || "";
 
@@ -143,6 +177,7 @@ const LABEL = { queued:"排队中", running:"运行中", waiting_quota:"等额�
                 succeeded:"成功", failed:"失败", cancelled:"已取消" };
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 const clock = ts => ts ? new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12:false }) : "";
+const dateClock = ts => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12:false, month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" }) : "—";
 function dur(t) {
   if (!t.started_at || !t.finished_at) return "";
   const s = Math.round(t.finished_at - t.started_at);
@@ -161,6 +196,9 @@ function stateCell(t) {
 function btns(t) {
   const b = [];
   const act = (a, label) => `<button class="mini" onclick="doAct('${t.id}','${a}')">${label}</button>`;
+  if (["queued", "waiting_quota", "paused"].includes(t.state)) {
+    b.push(`<button class="mini" onclick="beginEdit('${t.id}')">编辑</button>`);
+  }
   if (t.state === "queued")        b.push(act("pause","暂停"), act("cancel","取消"));
   if (t.state === "running")       b.push(act("cancel","取消"));
   if (t.state === "waiting_quota") b.push(act("resume","立即重试"), act("pause","暂停"), act("cancel","取消"));
@@ -170,7 +208,31 @@ function btns(t) {
   return b.join(" ");
 }
 
+function taskTool(t) {
+  const choice = `${t.model || "CLI 默认模型"} · ${t.effort || "默认强度"}`;
+  return `<b>${esc(t.tool)}</b><div class="taskChoice">${esc(choice)}</div>`;
+}
+
+function quotaCards(quota) {
+  return ["claude", "codex"].map(tool => {
+    const qi = quota[tool];
+    if (!qi) return "";
+    const windows = (qi.windows || []).map(w => {
+      const pct = Math.max(0, Math.min(100, Number(w.used_percent) || 0));
+      const warn = pct >= 90 ? "warn" : "";
+      return `<div class="quotaWindow"><span class="dim">${esc(w.label)}</span><span class="meter ${warn}"><i style="width:${pct}%"></i></span><span>${pct.toFixed(0)}%</span></div><div class="dim">${w.resets_at ? `重置：${dateClock(w.resets_at)}` : "未提供重置时间"}</div>`;
+    }).join("");
+    return `<div class="quotaCard"><div class="quotaTitle"><b>${tool === "claude" ? "Claude Code" : "Codex"}</b><span class="origin">${esc(qi.source || "unknown")}</span></div>${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}` : "未取得实时数据"}</div></div>`;
+  }).join("");
+}
+
+function renderProcesses(processes) {
+  $("processBody").innerHTML = (processes || []).map(p => `<tr><td><b>${esc(p.tool)}</b></td><td><span class="kind ${esc(p.kind)}">${p.kind === "managed" ? "AgentBar" : "外部"}</span></td><td class="mono">${esc(p.pid)}</td><td>${esc(p.state)}</td><td>${esc(p.elapsed)}</td><td class="mono dim">${esc(shorten(p.cwd || "—"))}</td><td>${p.title ? esc(p.title) : "<span class=\"dim\">外部任务（仅观测）</span>"}</td></tr>`).join("");
+  $("processEmpty").style.display = processes && processes.length ? "none" : "block";
+}
+
 function render(s) {
+  latestTasks = Object.fromEntries(s.tasks.map(t => [t.id, t]));
   const map = { running:["running","运行中"], waiting:["waiting","等待中"],
                 paused:["paused","已暂停"], idle:["idle","空闲"] };
   const [cls, label] = map[s.status] || ["idle", s.status];
@@ -183,24 +245,30 @@ function render(s) {
     const qi = s.quota[tool];
     if (!qi) { el.textContent = tool + ": 未注册"; continue; }
     el.className = "chip " + (qi.state === "ok" ? "ok" : qi.state === "limited" ? "limited" : "");
-    el.textContent = `${tool === "claude" ? "Claude" : "Codex"}: ${qi.state === "ok" ? "正常" : qi.state === "limited" ? "受限" : "未知"}`;
+    const first = (qi.windows || [])[0];
+    const percent = first ? ` · ${Number(first.used_percent).toFixed(0)}%` : "";
+    el.textContent = `${tool === "claude" ? "Claude" : "Codex"}: ${qi.state === "ok" ? "正常" : qi.state === "limited" ? "受限" : "未知"}${percent}`;
     el.title = `${qi.detail}（来源: ${qi.source}）`;
   }
+  $("quotaGrid").innerHTML = quotaCards(s.quota);
+  const authorize = $("btnAuthorizeClaude");
+  authorize.style.display = s.quota.claude && String(s.quota.claude.error || "").includes("Keychain") ? "inline-block" : "none";
   const active = s.tasks.filter(t => ["queued","running","waiting_quota","paused"].includes(t.state));
   const hist = s.tasks.filter(t => ["succeeded","failed","cancelled"].includes(t.state)).reverse();
   $("activeBody").innerHTML = active.map(t => `<tr>
     <td>${stateCell(t)}</td>
     <td><b>${esc(t.title)}</b><div class="dim">尝试 ${t.attempts} 次${t.quota_waits ? `，额度等待 ${t.quota_waits} 次` : ""}</div></td>
-    <td>${esc(t.tool)}</td><td class="mono dim">${esc(shorten(t.cwd))}</td>
+    <td>${taskTool(t)}</td><td class="mono dim">${esc(shorten(t.cwd))}</td>
     <td class="dim">${esc(t.state_reason)}</td><td>${btns(t)}</td></tr>`).join("");
   $("historyBody").innerHTML = hist.slice(0, 50).map(t => `<tr>
     <td>${stateCell(t)}</td>
     <td><b>${esc(t.title)}</b><div class="dim">${clock(t.finished_at)}</div></td>
-    <td>${esc(t.tool)}</td><td class="dim">${dur(t)}</td>
+    <td>${taskTool(t)}</td><td class="dim">${dur(t)}</td>
     <td class="dim">${t.cost_usd ? "$" + t.cost_usd.toFixed(3) : ""}</td>
     <td class="dim">${esc(t.state_reason)}</td><td>${btns(t)}</td></tr>`).join("");
   $("activeEmpty").style.display = active.length ? "none" : "block";
   $("historyEmpty").style.display = hist.length ? "none" : "block";
+  renderProcesses(s.cli_processes);
   $("settingsLine").textContent =
     `并行度 ${s.settings.max_parallel} · 每工具上限 ${s.settings.per_tool_limit}` +
     ` · 状态目录 ${s.settings.state_dir} · v${s.version}` +
@@ -224,13 +292,61 @@ async function loadTools() {
     const j = await api("/api/tools");
     $("fTool").innerHTML = j.tools.map(t =>
       `<option value="${t.name}" ${t.installed ? "" : "disabled"}>${t.display_name}${t.installed ? "" : "（未安装）"}</option>`).join("");
+    if (OPEN_REQUEST.tool) {
+      const requested = [...$("fTool").options].find(o => o.value === OPEN_REQUEST.tool && !o.disabled);
+      if (requested) $("fTool").value = requested.value;
+    }
+    updateModelChoices();
+    if (OPEN_REQUEST.focus === "prompt") setTimeout(() => $("fPrompt").focus(), 0);
   } catch (e) {}
+}
+
+function updateModelChoices() {
+  const tool = $("fTool").value;
+  const presets = tool === "claude" ? ["sonnet", "opus", "fable"] : [];
+  $("modelChoices").innerHTML = presets.map(v => `<option value="${v}">`).join("");
+  const efforts = tool === "claude" ? ["low", "medium", "high", "xhigh", "max"]
+                                      : ["low", "medium", "high", "xhigh"];
+  $("fEffort").innerHTML = `<option value="">默认强度</option>` + efforts.map(v => `<option value="${v}">${v}</option>`).join("");
+  $("modelHint").textContent = tool === "claude"
+    ? "Claude 可选模型别名：sonnet / opus / fable；强度会传给 --effort。"
+    : "Codex：填写账号已开放的模型 ID；强度通过其 config override 设置。留空即使用你的 Codex 默认配置。";
 }
 
 window.doAct = async (id, action) => {
   try { await api(`/api/tasks/${id}/${action}`, { method:"POST" }); refresh(); }
   catch (e) { alert("操作失败: " + e.message); }
 };
+
+let latestTasks = {}, editingTaskId = null;
+window.beginEdit = id => {
+  const t = latestTasks[id];
+  if (!t) return;
+  editingTaskId = id;
+  $("fPrompt").value = t.prompt || "";
+  $("fCwd").value = t.cwd || "";
+  $("fTitle").value = t.title || "";
+  $("fTool").value = t.tool;
+  updateModelChoices();
+  $("fModel").value = t.model || "";
+  $("fEffort").value = t.effort || "";
+  $("fProfile").value = t.profile || "edits";
+  $("btnSubmit").textContent = "保存修改";
+  $("btnCancelEdit").style.display = "inline-block";
+  $("editHint").textContent = "正在编辑排队任务。保存后，等待额度的任务会立即重新入队。";
+  $("editHint").style.display = "block";
+  $("addForm").scrollIntoView({ behavior:"smooth", block:"center" });
+  $("fPrompt").focus();
+};
+
+function cancelEdit() {
+  editingTaskId = null;
+  $("addForm").reset();
+  $("btnSubmit").textContent = "添加任务";
+  $("btnCancelEdit").style.display = "none";
+  $("editHint").style.display = "none";
+  updateModelChoices();
+}
 
 let logTaskId = null, logTimer = null;
 window.openLog = async (id) => {
@@ -251,15 +367,24 @@ window.closeLog = () => { logTaskId = null; clearInterval(logTimer); $("logWrap"
 
 $("addForm").addEventListener("submit", async ev => {
   ev.preventDefault();
+  const id = editingTaskId;
+  const body = {
+    prompt: $("fPrompt").value, tool: $("fTool").value, cwd: $("fCwd").value,
+    title: $("fTitle").value, profile: $("fProfile").value,
+    model: $("fModel").value.trim() || null, effort: $("fEffort").value || null };
   try {
-    await api("/api/tasks", { method:"POST", body: JSON.stringify({
-      prompt: $("fPrompt").value, tool: $("fTool").value, cwd: $("fCwd").value,
-      title: $("fTitle").value, profile: $("fProfile").value }) });
-    $("fPrompt").value = ""; $("fTitle").value = ""; refresh();
-  } catch (e) { alert("添加失败: " + e.message); }
+    await api(id ? `/api/tasks/${id}` : "/api/tasks", {
+      method: id ? "PUT" : "POST", body: JSON.stringify(body) });
+    cancelEdit();
+    await refresh();
+  } catch (e) { alert((id ? "保存失败: " : "添加失败: ") + e.message); }
 });
-$("btnPause").onclick = () => api("/api/pause-all", { method:"POST" }).then(refresh);
-$("btnResume").onclick = () => api("/api/resume-all", { method:"POST" }).then(refresh);
+$("fTool").onchange = updateModelChoices;
+$("btnCancelEdit").onclick = cancelEdit;
+$("btnPause").onclick = () => api("/api/pause-all", { method:"POST" }).then(refresh).catch(e => alert(e.message));
+$("btnResume").onclick = () => api("/api/resume-all", { method:"POST" }).then(refresh).catch(e => alert(e.message));
+$("btnRefreshQuota").onclick = () => api("/api/quota/refresh", { method:"POST" }).then(refresh).catch(e => alert(e.message));
+$("btnAuthorizeClaude").onclick = () => api("/api/quota/authorize-claude", { method:"POST" }).then(refresh).catch(e => alert(e.message));
 
 loadTools(); refresh(); setInterval(refresh, 2000);
 </script>

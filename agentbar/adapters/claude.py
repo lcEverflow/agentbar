@@ -21,6 +21,10 @@ class ClaudeAdapter(Adapter):
 
     def build_argv(self, task: Task, resume: bool, binary: str) -> list[str]:
         argv = [binary, "-p", "--output-format", "json"]
+        if task.model:
+            argv += ["--model", task.model]
+        if task.effort:
+            argv += ["--effort", task.effort]
         if task.profile == "readonly":
             argv += ["--allowedTools", READONLY_TOOLS,
                      "--disallowedTools", "Bash,Edit,Write,NotebookEdit"]

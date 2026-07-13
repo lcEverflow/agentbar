@@ -33,8 +33,19 @@ def settings(tmp_path, monkeypatch):
 
 @pytest.fixture
 def core(settings):
+    # Scheduler tests exercise lifecycle/API behavior, never the user's real
+    # Keychain or provider network. Keep them deterministic now that the
+    # macOS Security bridge is installed in the development environment.
+    # (The fetcher/parser itself has dedicated tests.)
+    from agentbar import quota as quota_module
+
+    original_fetchers = quota_module.get_usage_fetchers
+    quota_module.get_usage_fetchers = lambda: {}
     store = StateStore(settings.state_dir)
     c = Scheduler(settings, store)
     c.start()
-    yield c
-    c.shutdown()
+    try:
+        yield c
+    finally:
+        c.shutdown()
+        quota_module.get_usage_fetchers = original_fetchers

@@ -29,6 +29,7 @@ class Settings:
     allow_full_profile: bool = False   # 高权限档位默认关闭
     task_timeout_seconds: int = 7200   # 单任务运行上限
     backoff_minutes: list[float] = field(default_factory=lambda: [5, 15, 30, 60])
+    usage_refresh_seconds: int = 120    # 订阅额度接口轮询间隔（最小 30 秒）
     tick_seconds: float = 1.0
     tool_paths: dict = field(default_factory=dict)  # 手动指定 CLI 路径: {"claude": "/path"}
     token: str = ""
@@ -46,6 +47,7 @@ _PERSISTED_KEYS = (
     "allow_full_profile",
     "task_timeout_seconds",
     "backoff_minutes",
+    "usage_refresh_seconds",
     "tool_paths",
     "token",
 )

@@ -12,7 +12,7 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import __version__
 from .config import Settings
@@ -37,11 +37,18 @@ class ApiServer:
     def port(self) -> int:
         return self.httpd.server_address[1]
 
-    def url(self, with_token: bool = False) -> str:
+    def url(self, with_token: bool = False, **query: str) -> str:
+        """Return a local panel URL, optionally carrying an authenticated UI intent.
+
+        The menu-bar quick-add action deliberately uses the same full editor as
+        the panel; a native one-line prompt dialog cannot safely expose cwd,
+        model, effort and permission choices.
+        """
         base = f"http://127.0.0.1:{self.port}/"
+        params = {key: str(value) for key, value in query.items() if value is not None}
         if with_token:
-            base += f"?token={self.settings.token}"
-        return base
+            params["token"] = self.settings.token
+        return base + (f"?{urlencode(params)}" if params else "")
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -160,6 +167,8 @@ def _make_handler(core: Scheduler, settings: Settings):
                         cwd=body.get("cwd", ""),
                         title=body.get("title"),
                         profile=body.get("profile", "edits"),
+                        model=body.get("model"),
+                        effort=body.get("effort"),
                     )
                 except ValueError as e:
                     self._json(400, {"ok": False, "error": str(e)})
@@ -174,12 +183,46 @@ def _make_handler(core: Scheduler, settings: Settings):
                 core.resume_all()
                 self._json(200, {"ok": True})
                 return
+            if path == "/api/quota/refresh":
+                core.quota.refresh_now()
+                self._json(202, {"ok": True, "message": "额度刷新已触发"})
+                return
+            if path == "/api/quota/authorize-claude":
+                # 仅由用户在本机面板主动调用，后台刷新不会触发 Keychain 弹窗。
+                ok = core.quota.authorize_claude_keychain()
+                self._json(200 if ok else 400, {
+                    "ok": ok,
+                    "message": "Claude Keychain 已授权并刷新" if ok else "未取得 Claude Keychain 授权",
+                })
+                return
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"]:
                 ok, msg = core.act(parts[3], parts[4])
                 self._json(200 if ok else 400, {"ok": ok, "message": msg, "error": msg})
                 return
             self._json(404, {"ok": False, "error": "not found"})
+
+        def do_PUT(self):
+            if not self._host_ok():
+                self._json(403, {"ok": False, "error": "bad host"})
+                return
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            path = u.path.rstrip("/")
+            if not self._authed(q):
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+
+            parts = path.split("/")
+            if len(parts) != 4 or parts[1:3] != ["api", "tasks"]:
+                self._json(404, {"ok": False, "error": "not found"})
+                return
+            try:
+                t = core.edit_task(parts[3], self._body())
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": str(e)})
+                return
+            self._json(200, {"ok": True, "task": t.to_dict()})
 
     _INDEX_HTML = _load_index_html()
     return Handler

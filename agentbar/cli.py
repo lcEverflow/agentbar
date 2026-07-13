@@ -15,8 +15,9 @@ import urllib.request
 from pathlib import Path
 
 from . import __version__
+from .browser import open_panel_url
 from .config import Settings, load_settings
-from .models import PROFILES
+from .models import EFFORTS, PROFILES
 from .scheduler import Scheduler
 from .server import ApiServer
 from .store import StateStore
@@ -77,12 +78,14 @@ def _instance_alive(settings: Settings) -> bool:
 
 
 def cmd_run(args, settings: Settings) -> int:
+    # 先应用端口覆盖再查重：实例身份 = state dir + 端口，
+    # 否则 --port/--state-dir 启动的独立实例会被别的实例误判为"已在运行"
+    if args.port is not None:
+        settings.port = args.port
     if _instance_alive(settings):
         print("AgentBar 已在运行（用 `agentbar open` 打开面板，或先退出旧实例）")
         return 2
     _setup_logging(settings)
-    if args.port is not None:
-        settings.port = args.port
     store = StateStore(settings.state_dir)
     core = Scheduler(settings, store)
     server = ApiServer(core, settings)
@@ -113,7 +116,7 @@ def cmd_run(args, settings: Settings) -> int:
             store.clear_runtime()
         return 0
 
-    # menu bar 模式：rumps 跑在主线程；信号触发时在后台线程做清理再退出
+    # menu bar 模式：AppKit 事件循环占主线程；信号在后台线程清理后停掉主循环
     from .menubar import AgentBarApp  # 延迟 import，headless/测试不依赖 pyobjc
 
     app = AgentBarApp(core, settings, server)
@@ -123,9 +126,7 @@ def cmd_run(args, settings: Settings) -> int:
         core.shutdown()
         server.stop()
         store.clear_runtime()
-        import rumps
-
-        rumps.quit_application()
+        app.stop_from_thread()
 
     threading.Thread(target=_watch_signal, daemon=True).start()
     app.run()
@@ -139,13 +140,16 @@ def cmd_add(args, settings: Settings) -> int:
         "cwd": args.cwd,
         "title": args.title,
         "profile": args.profile,
+        "model": args.model,
+        "effort": args.effort,
     }
     resp = _request(settings, "POST", "/api/tasks", body)
     if not resp.get("ok"):
         print(f"添加失败: {resp.get('error')}", file=sys.stderr)
         return 1
     t = resp["task"]
-    print(f"已入队 [{t['id']}] {t['title']}  (tool={t['tool']}, profile={t['profile']})")
+    choice = f"model={t.get('model') or 'default'}, effort={t.get('effort') or 'default'}"
+    print(f"已入队 [{t['id']}] {t['title']}  (tool={t['tool']}, profile={t['profile']}, {choice})")
     return 0
 
 
@@ -179,9 +183,9 @@ def cmd_open(args, settings: Settings) -> int:
     url = f"{base}/?token={token}"
     print(url)
     if _instance_alive(settings):
-        import webbrowser
-
-        webbrowser.open(url)
+        if not open_panel_url(url):
+            print("无法调用 macOS 浏览器；请复制上面的链接手动打开。", file=sys.stderr)
+            return 1
     else:
         print("（调度器未运行，先执行 agentbar run）")
     return 0
@@ -228,6 +232,8 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--tool", default="claude", help="claude | codex（默认 claude）")
     sp.add_argument("--cwd", default=os.getcwd(), help="工作目录（默认当前目录）")
     sp.add_argument("--profile", default="edits", choices=PROFILES)
+    sp.add_argument("--model", help="模型 ID；不填时使用对应 CLI 默认模型")
+    sp.add_argument("--effort", choices=EFFORTS, help="推理强度；不填时使用 CLI 默认")
     sp.add_argument("--title", default=None)
     sp.add_argument("prompt", nargs="+", help="任务 prompt")
     sp.set_defaults(fn=cmd_add)

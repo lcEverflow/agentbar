@@ -1,12 +1,15 @@
 import json
 
+import pytest
+
 from agentbar.models import Task, TaskState, default_title
 from agentbar.store import StateStore
 
 
 def test_task_roundtrip():
     t = Task(id="abc", title="t", prompt="p", tool="claude", cwd="/tmp",
-             state=TaskState.WAITING_QUOTA, next_retry_at=123.0, session_id="s1")
+             state=TaskState.WAITING_QUOTA, next_retry_at=123.0, session_id="s1",
+             model="opus", effort="high")
     d = t.to_dict()
     assert d["state"] == "waiting_quota"
     t2 = Task.from_dict(json.loads(json.dumps(d)))
@@ -43,3 +46,5 @@ def test_log_tail(tmp_path):
     st.log_path("t1").write_bytes(b"A" * 100 + b"TAIL")
     assert st.read_log_tail("t1", max_bytes=10).endswith("TAIL")
     assert st.read_log_tail("missing") == ""
+
+

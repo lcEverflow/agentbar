@@ -4,9 +4,9 @@ from agentbar.config import Settings
 from agentbar.models import Task
 
 
-def _task(tool, profile="edits", session=None):
+def _task(tool, profile="edits", session=None, model=None, effort=None):
     return Task(id="t1", title="t", prompt="do things", tool=tool, cwd="/tmp",
-                profile=profile, session_id=session)
+                profile=profile, session_id=session, model=model, effort=effort)
 
 
 def test_claude_default_is_safe(tmp_path):
@@ -41,6 +41,13 @@ def test_claude_resume(tmp_path):
     assert "原始任务" in a.stdin_payload(t, resume=True)
 
 
+def test_claude_model_and_effort(tmp_path):
+    a = ClaudeAdapter(Settings(state_dir=tmp_path))
+    argv = a.build_argv(_task("claude", model="opus", effort="high"), False, "claude")
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--effort") + 1] == "high"
+
+
 def test_codex_sandbox_flags(tmp_path):
     a = CodexAdapter(Settings(state_dir=tmp_path))
     ro = a.build_argv(_task("codex", "readonly"), resume=False, binary="codex")
@@ -58,3 +65,10 @@ def test_codex_resume_subcommand(tmp_path):
     argv = a.build_argv(t, resume=True, binary="codex")
     assert argv[1:4] == ["exec", "resume", "0199-abc"]
     assert argv[-1] == "-"  # prompt 走 stdin
+
+
+def test_codex_model_and_effort_config_override(tmp_path):
+    a = CodexAdapter(Settings(state_dir=tmp_path))
+    argv = a.build_argv(_task("codex", model="my-codex", effort="xhigh"), False, "codex")
+    assert argv[argv.index("--model") + 1] == "my-codex"
+    assert argv[argv.index("--config") + 1] == 'model_reasoning_effort="xhigh"'

@@ -19,6 +19,7 @@ from . import __version__
 from .adapters.base import Outcome, get_registry
 from .config import Settings
 from .models import (
+    EFFORTS,
     FINISHED_STATES,
     PROFILES,
     Task,
@@ -52,6 +53,7 @@ class _Run:
         self.cancel = threading.Event()
         self.mode = "cancel"  # "cancel"(用户取消) | "interrupt"(调度器退出，回队列)
         self.thread: threading.Thread | None = None
+        self.started = threading.Event()
         self.was_resume = False
 
 
@@ -130,7 +132,13 @@ class Scheduler:
             run.cancel.set()
         for _tid, run in runs:
             if run.thread:
-                run.thread.join(timeout=20)
+                # `_tick` stores the Thread immediately before `.start()`;
+                # shutdown can win that tiny race. Wait for the worker's first
+                # instruction before joining so Python never sees an unstarted
+                # Thread object.
+                run.started.wait(timeout=1)
+                if run.thread.ident is not None:
+                    run.thread.join(timeout=20)
         self.quota.stop()
         with self._lock:
             self._persist_locked()
@@ -148,6 +156,8 @@ class Scheduler:
         cwd: str,
         title: str | None = None,
         profile: str = "edits",
+        model: str | None = None,
+        effort: str | None = None,
     ) -> Task:
         prompt = (prompt or "").strip()
         if not prompt:
@@ -163,6 +173,12 @@ class Scheduler:
                 "高权限档位默认关闭。如确需开启，编辑 config.json 设置 "
                 "allow_full_profile=true 后重启"
             )
+        model = (model or "").strip() or None
+        if model and (len(model) > 120 or any(c in model for c in "\r\n\x00")):
+            raise ValueError("模型名称无效（最多 120 个字符，不能包含换行）")
+        effort = (effort or "").strip().lower() or None
+        if effort and effort not in EFFORTS:
+            raise ValueError(f"未知强度档位 {effort!r}，可用: {EFFORTS}")
         cwd = os.path.abspath(os.path.expanduser(cwd or self.settings.default_cwd))
         if not os.path.isdir(cwd):
             raise ValueError(f"工作目录不存在: {cwd}")
@@ -173,6 +189,8 @@ class Scheduler:
             tool=tool,
             cwd=cwd,
             profile=profile,
+            model=model,
+            effort=effort,
         )
         with self._lock:
             self._tasks[t.id] = t
@@ -180,6 +198,64 @@ class Scheduler:
             self._persist_locked()
         self._wake.set()
         log.info("task %s added (%s, %s)", t.id, tool, t.title)
+        return t
+
+    def edit_task(self, task_id: str, changes: dict) -> Task:
+        """Edit a task that has not started running.
+
+        A live CLI process is intentionally immutable: changing its prompt or
+        safety profile would make the displayed task diverge from the command
+        already executing. Users can cancel a running task and create/retry a
+        replacement instead.
+        """
+        with self._lock:
+            t = self._tasks.get(task_id)
+            if not t:
+                raise ValueError("任务不存在")
+            if t.state == TaskState.RUNNING:
+                raise ValueError("运行中的任务不能编辑；请先取消，再新建或重试")
+            if t.state not in {
+                TaskState.QUEUED, TaskState.PAUSED, TaskState.WAITING_QUOTA,
+            }:
+                raise ValueError(f"状态 {t.state.value} 的任务不能编辑；请使用重试创建新运行")
+
+            prompt = (changes.get("prompt", t.prompt) or "").strip()
+            if not prompt:
+                raise ValueError("prompt 不能为空")
+            if len(prompt) > 100_000:
+                raise ValueError("prompt 过长（>100KB）")
+
+            tool = changes.get("tool", t.tool)
+            if tool not in self.registry:
+                raise ValueError(f"未知工具 {tool!r}，可用: {sorted(self.registry)}")
+
+            profile = changes.get("profile", t.profile)
+            if profile not in PROFILES:
+                raise ValueError(f"未知权限档位 {profile!r}，可用: {PROFILES}")
+            if profile == "full" and not self.settings.allow_full_profile:
+                raise ValueError("高权限档位默认关闭。如确需开启，编辑 config.json 设置 allow_full_profile=true 后重启")
+
+            model = (changes.get("model", t.model) or "").strip() or None
+            if model and (len(model) > 120 or any(c in model for c in "\r\n\x00")):
+                raise ValueError("模型名称无效（最多 120 个字符，不能包含换行）")
+            effort = (changes.get("effort", t.effort) or "").strip().lower() or None
+            if effort and effort not in EFFORTS:
+                raise ValueError(f"未知强度档位 {effort!r}，可用: {EFFORTS}")
+
+            cwd = os.path.abspath(os.path.expanduser(changes.get("cwd", t.cwd) or self.settings.default_cwd))
+            if not os.path.isdir(cwd):
+                raise ValueError(f"工作目录不存在: {cwd}")
+
+            title = (changes.get("title", t.title) or "").strip() or default_title(prompt)
+            t.prompt, t.tool, t.cwd = prompt, tool, cwd
+            t.title, t.profile, t.model, t.effort = title, profile, model, effort
+            if t.state == TaskState.WAITING_QUOTA:
+                t.state = TaskState.QUEUED
+                t.next_retry_at = None
+                t.state_reason = "编辑后重新入队"
+            self._persist_locked()
+        self._wake.set()
+        log.info("task %s edited", task_id)
         return t
 
     def act(self, task_id: str, action: str) -> tuple[bool, str]:
@@ -277,14 +353,37 @@ class Scheduler:
             "waiting_quota": n_waiting,
             "tasks": tasks,
             "quota": {name: self.quota.status(name).to_dict() for name in self.registry},
+            "cli_processes": self._cli_processes_snapshot(),
             "settings": {
                 "max_parallel": self.settings.max_parallel,
                 "per_tool_limit": self.settings.per_tool_limit,
+                "usage_refresh_seconds": self.settings.usage_refresh_seconds,
                 "default_cwd": self.settings.default_cwd,
                 "allow_full_profile": self.settings.allow_full_profile,
                 "state_dir": str(self.settings.state_dir),
             },
         }
+
+    def _cli_processes_snapshot(self) -> list[dict]:
+        """返回本机 Claude/Codex 的脱敏进程观测；扫描失败不能影响调度。"""
+        try:
+            from .processes import discover_cli_processes
+
+            with self._lock:
+                owned = {
+                    run.proc.pid: {
+                        "tool": self._tasks[tid].tool,
+                        "task_id": tid,
+                        "title": self._tasks[tid].title,
+                        "cwd": self._tasks[tid].cwd,
+                    }
+                    for tid, run in self._running.items()
+                    if run.proc and run.proc.poll() is None and tid in self._tasks
+                }
+            return discover_cli_processes(owned)
+        except Exception:
+            log.debug("CLI process scan failed", exc_info=True)
+            return []
 
     # ================= tick loop =================
 
@@ -360,6 +459,7 @@ class Scheduler:
     # ================= task execution =================
 
     def _run_task(self, task_id: str, run: _Run) -> None:
+        run.started.set()
         with self._lock:
             t = self._tasks.get(task_id)
             if not t:

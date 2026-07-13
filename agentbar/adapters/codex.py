@@ -7,6 +7,7 @@ session id 从输出 banner 的 `session id: <uuid>` 行提取。
 
 from __future__ import annotations
 
+import json
 import re
 
 from ..models import Task
@@ -32,6 +33,11 @@ class CodexAdapter(Adapter):
         argv = [binary, "exec"]
         if resume and task.session_id:
             argv += ["resume", task.session_id]
+        if task.model:
+            argv += ["--model", task.model]
+        if task.effort:
+            # Codex 通过 config override 设置推理强度，不伪造不存在的 --effort flag。
+            argv += ["--config", f"model_reasoning_effort={json.dumps(task.effort)}"]
         argv += self._sandbox_flags(task)
         argv += ["--skip-git-repo-check", "-"]
         return argv

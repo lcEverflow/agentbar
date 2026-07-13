@@ -84,9 +84,49 @@ def test_add_task_validation_errors(api, tmp_path):
         {"prompt": "OK", "tool": "nope", "cwd": str(tmp_path)},
         {"prompt": "OK", "tool": "fake", "cwd": "/no/such/dir"},
         {"prompt": "OK", "tool": "fake", "cwd": str(tmp_path), "profile": "full"},
+        {"prompt": "OK", "tool": "fake", "cwd": str(tmp_path), "effort": "ultra"},
     ):
         code, j = _call(srv, "/api/tasks", "POST", s.token, body)
         assert code == 400, body
+
+
+def test_add_task_records_model_and_effort(api, tmp_path):
+    srv, s = api
+    code, j = _call(srv, "/api/tasks", "POST", s.token, {
+        "prompt": "OK", "tool": "fake", "cwd": str(tmp_path),
+        "model": "custom-small", "effort": "low",
+    })
+    assert code == 200, j
+    assert j["task"]["model"] == "custom-small"
+    assert j["task"]["effort"] == "low"
+
+
+def test_edit_queued_task_via_api(api, core, tmp_path):
+    srv, s = api
+    core.pause_all()  # keep the fake task queued while editing it
+    code, j = _call(srv, "/api/tasks", "POST", s.token, {
+        "prompt": "old", "tool": "fake", "cwd": str(tmp_path),
+    })
+    assert code == 200, j
+    task_id = j["task"]["id"]
+
+    code, j = _call(srv, f"/api/tasks/{task_id}", "PUT", s.token, {
+        "prompt": "new prompt", "title": "new title", "tool": "fake",
+        "cwd": str(tmp_path), "profile": "edits", "model": "small", "effort": "low",
+    })
+    assert code == 200, j
+    assert j["task"]["state"] == "queued"
+    assert j["task"]["prompt"] == "new prompt"
+    assert j["task"]["model"] == "small"
+    assert j["task"]["effort"] == "low"
+
+
+def test_panel_url_preserves_token_and_quick_add_intent(api):
+    srv, s = api
+    url = srv.url(with_token=True, tool="claude", focus="prompt")
+    assert f"token={s.token}" in url
+    assert "tool=claude" in url
+    assert "focus=prompt" in url
 
 
 def test_pause_resume_all(api, core):
@@ -95,6 +135,12 @@ def test_pause_resume_all(api, core):
     assert core.paused is True
     assert _call(srv, "/api/resume-all", "POST", s.token)[0] == 200
     assert core.paused is False
+
+
+def test_quota_refresh_endpoint(api):
+    srv, s = api
+    code, j = _call(srv, "/api/quota/refresh", "POST", s.token)
+    assert code == 202 and j["ok"]
 
 
 def test_tools_endpoint(api):
