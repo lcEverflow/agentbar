@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AgentBar 任务面板</title>
+<style>
+  :root { --bg:#14161a; --card:#1d2026; --fg:#e6e8eb; --dim:#9aa3ad; --line:#2b2f36;
+          --blue:#4a9eff; --green:#3ec97e; --red:#ff6b6b; --amber:#f5b942; --grey:#6b7480; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,"PingFang SC","Helvetica Neue",sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px;
+           background:var(--card); border-bottom:1px solid var(--line);
+           position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+  #dot { width:10px; height:10px; border-radius:50%; background:var(--grey); }
+  #dot.running { background:var(--blue); box-shadow:0 0 6px var(--blue); }
+  #dot.waiting { background:var(--amber); }
+  #dot.paused  { background:var(--grey); }
+  #dot.idle    { background:var(--green); }
+  .chip { padding:2px 10px; border-radius:10px; background:#262a31; color:var(--dim);
+          font-size:12px; cursor:default; }
+  .chip.ok      { color:var(--green); }
+  .chip.limited { color:var(--amber); }
+  .spacer { flex:1; }
+  button { background:#2a2f37; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:5px 12px; cursor:pointer; font-size:13px; }
+  button:hover { background:#343a44; }
+  button.primary { background:var(--blue); border-color:var(--blue); color:#fff; }
+  button.mini { padding:2px 8px; font-size:12px; }
+  main { max-width:1080px; margin:0 auto; padding:16px 20px 60px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px;
+            padding:14px 16px; margin-bottom:16px; }
+  h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; }
+  #banner { display:none; background:#4a2626; color:#ffb4b4; padding:8px 20px; }
+  form .row { display:flex; gap:10px; margin-bottom:8px; flex-wrap:wrap; }
+  input, select, textarea { background:#14161a; color:var(--fg); border:1px solid var(--line);
+                            border-radius:6px; padding:6px 9px; font-size:13px; }
+  textarea { width:100%; min-height:64px; resize:vertical; font-family:inherit; }
+  input { flex:1; min-width:140px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--dim); font-weight:500; padding:4px 8px;
+       border-bottom:1px solid var(--line); }
+  td { padding:6px 8px; border-bottom:1px solid #23262c; vertical-align:top; }
+  .st { display:inline-block; padding:1px 8px; border-radius:9px; font-size:12px; }
+  .st.queued        { background:#2a2f37; color:var(--dim); }
+  .st.running       { background:#173a5e; color:var(--blue); }
+  .st.waiting_quota { background:#4a3a15; color:var(--amber); }
+  .st.paused        { background:#2a2f37; color:var(--grey); }
+  .st.succeeded     { background:#173a29; color:var(--green); }
+  .st.failed        { background:#4a2222; color:var(--red); }
+  .st.cancelled     { background:#2a2f37; color:var(--grey); }
+  .dim  { color:var(--dim); font-size:12px; }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  #logWrap { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:10; }
+  #logBox { position:absolute; inset:6% 8%; background:#111318; border:1px solid var(--line);
+            border-radius:10px; display:flex; flex-direction:column; }
+  #logHead { display:flex; align-items:center; padding:10px 14px;
+             border-bottom:1px solid var(--line); }
+  #logBody { flex:1; overflow:auto; margin:0; padding:12px 14px; white-space:pre-wrap;
+             font:12px/1.5 ui-monospace,Menlo,monospace; color:#c8d0d8; }
+  footer { color:var(--dim); font-size:12px; padding:8px 2px; }
+</style>
+</head>
+<body>
+<header>
+  <div id="dot"></div>
+  <b id="statusText">连接中…</b>
+  <span class="chip" id="quota-claude" title="">Claude: …</span>
+  <span class="chip" id="quota-codex" title="">Codex: …</span>
+  <div class="spacer"></div>
+  <button id="btnPause">⏸ 全部暂停</button>
+  <button id="btnResume">▶ 全部恢复</button>
+</header>
+<div id="banner"></div>
+<main>
+  <section>
+    <h2>添加任务</h2>
+    <form id="addForm">
+      <div class="row"><textarea id="fPrompt" placeholder="Prompt — 要交给 AI CLI 的任务描述…" required></textarea></div>
+      <div class="row">
+        <select id="fTool"></select>
+        <input id="fCwd" placeholder="工作目录"/>
+        <select id="fProfile">
+          <option value="readonly">🔒 只读</option>
+          <option value="edits" selected>✏️ 可编辑文件（默认）</option>
+          <option value="full">⚠️ 完全权限</option>
+        </select>
+        <input id="fTitle" placeholder="标题（可选）" style="max-width:200px"/>
+        <button type="submit" class="primary">添加任务</button>
+      </div>
+      <div class="dim" id="profileHint"></div>
+    </form>
+  </section>
+  <section>
+    <h2>进行中 / 队列</h2>
+    <table><thead><tr><th>状态</th><th>任务</th><th>工具</th><th>目录</th><th>说明</th><th></th></tr></thead>
+    <tbody id="activeBody"></tbody></table>
+    <div class="dim" id="activeEmpty">暂无任务</div>
+  </section>
+  <section>
+    <h2>历史记录</h2>
+    <table><thead><tr><th>状态</th><th>任务</th><th>工具</th><th>耗时</th><th>费用</th><th>说明</th><th></th></tr></thead>
+    <tbody id="historyBody"></tbody></table>
+    <div class="dim" id="historyEmpty">暂无历史</div>
+  </section>
+  <footer id="settingsLine"></footer>
+</main>
+
+<div id="logWrap" onclick="if(event.target===this)closeLog()">
+  <div id="logBox">
+    <div id="logHead"><b id="logTitle">日志</b><div class="spacer"></div>
+      <button class="mini" onclick="closeLog()">关闭</button></div>
+    <pre id="logBody"></pre>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+// ---- token：来自 URL ?token=（菜单栏/CLI 打开时携带），存 localStorage ----
+(() => {
+  const u = new URL(location.href);
+  const t = u.searchParams.get("token");
+  if (t) { localStorage.setItem("agentbar_token", t);
+           u.searchParams.delete("token"); history.replaceState(null, "", u); }
+})();
+const TOKEN = () => localStorage.getItem("agentbar_token") || "";
+
+function showBanner(msg) { const b = $("banner"); b.textContent = msg; b.style.display = "block"; }
+function hideBanner() { $("banner").style.display = "none"; }
+
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({ "X-Agentbar-Token": TOKEN(),
+                                 "Content-Type": "application/json" }, opts.headers || {});
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) { showBanner("未授权：请在终端运行 `agentbar open`，用带令牌的链接重新打开本页"); throw new Error("401"); }
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+const LABEL = { queued:"排队中", running:"运行中", waiting_quota:"等额度", paused:"已暂停",
+                succeeded:"成功", failed:"失败", cancelled:"已取消" };
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const clock = ts => ts ? new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12:false }) : "";
+function dur(t) {
+  if (!t.started_at || !t.finished_at) return "";
+  const s = Math.round(t.finished_at - t.started_at);
+  return s >= 60 ? `${Math.floor(s/60)}m${s%60}s` : `${s}s`;
+}
+
+function stateCell(t) {
+  let extra = "";
+  if (t.state === "waiting_quota" && t.next_retry_at) {
+    const left = Math.max(0, Math.round(t.next_retry_at - Date.now()/1000));
+    extra = `<div class="dim">${Math.floor(left/60)}m${left%60}s 后重试</div>`;
+  }
+  return `<span class="st ${t.state}">${LABEL[t.state] || t.state}</span>${extra}`;
+}
+
+function btns(t) {
+  const b = [];
+  const act = (a, label) => `<button class="mini" onclick="doAct('${t.id}','${a}')">${label}</button>`;
+  if (t.state === "queued")        b.push(act("pause","暂停"), act("cancel","取消"));
+  if (t.state === "running")       b.push(act("cancel","取消"));
+  if (t.state === "waiting_quota") b.push(act("resume","立即重试"), act("pause","暂停"), act("cancel","取消"));
+  if (t.state === "paused")        b.push(act("resume","恢复"), act("cancel","取消"));
+  if (["succeeded","failed","cancelled"].includes(t.state)) b.push(act("retry","重试"));
+  b.push(`<button class="mini" onclick="openLog('${t.id}',this)">日志</button>`);
+  return b.join(" ");
+}
+
+function render(s) {
+  const map = { running:["running","运行中"], waiting:["waiting","等待中"],
+                paused:["paused","已暂停"], idle:["idle","空闲"] };
+  const [cls, label] = map[s.status] || ["idle", s.status];
+  $("dot").className = cls;
+  $("statusText").textContent = label +
+    (s.running_titles.length ? `：${s.running_titles.join("、")}` : "") +
+    (s.queued ? `（队列 ${s.queued}）` : "");
+  for (const tool of ["claude", "codex"]) {
+    const el = $("quota-" + tool); if (!el) continue;
+    const qi = s.quota[tool];
+    if (!qi) { el.textContent = tool + ": 未注册"; continue; }
+    el.className = "chip " + (qi.state === "ok" ? "ok" : qi.state === "limited" ? "limited" : "");
+    el.textContent = `${tool === "claude" ? "Claude" : "Codex"}: ${qi.state === "ok" ? "正常" : qi.state === "limited" ? "受限" : "未知"}`;
+    el.title = `${qi.detail}（来源: ${qi.source}）`;
+  }
+  const active = s.tasks.filter(t => ["queued","running","waiting_quota","paused"].includes(t.state));
+  const hist = s.tasks.filter(t => ["succeeded","failed","cancelled"].includes(t.state)).reverse();
+  $("activeBody").innerHTML = active.map(t => `<tr>
+    <td>${stateCell(t)}</td>
+    <td><b>${esc(t.title)}</b><div class="dim">尝试 ${t.attempts} 次${t.quota_waits ? `，额度等待 ${t.quota_waits} 次` : ""}</div></td>
+    <td>${esc(t.tool)}</td><td class="mono dim">${esc(shorten(t.cwd))}</td>
+    <td class="dim">${esc(t.state_reason)}</td><td>${btns(t)}</td></tr>`).join("");
+  $("historyBody").innerHTML = hist.slice(0, 50).map(t => `<tr>
+    <td>${stateCell(t)}</td>
+    <td><b>${esc(t.title)}</b><div class="dim">${clock(t.finished_at)}</div></td>
+    <td>${esc(t.tool)}</td><td class="dim">${dur(t)}</td>
+    <td class="dim">${t.cost_usd ? "$" + t.cost_usd.toFixed(3) : ""}</td>
+    <td class="dim">${esc(t.state_reason)}</td><td>${btns(t)}</td></tr>`).join("");
+  $("activeEmpty").style.display = active.length ? "none" : "block";
+  $("historyEmpty").style.display = hist.length ? "none" : "block";
+  $("settingsLine").textContent =
+    `并行度 ${s.settings.max_parallel} · 每工具上限 ${s.settings.per_tool_limit}` +
+    ` · 状态目录 ${s.settings.state_dir} · v${s.version}` +
+    (s.settings.allow_full_profile ? " · ⚠️ 已允许完全权限档位" : "");
+  if (!s.settings.allow_full_profile) {
+    [...$("fProfile").options].find(o => o.value === "full").disabled = true;
+    $("profileHint").textContent = "完全权限档位已禁用（默认安全）。需要时在 config.json 设 allow_full_profile=true。";
+  }
+  if (!$("fCwd").value) $("fCwd").value = s.settings.default_cwd;
+}
+
+const shorten = p => p.length > 38 ? "…" + p.slice(-37) : p;
+
+async function refresh() {
+  try { render(await api("/api/state")); hideBanner(); }
+  catch (e) { if (e.message !== "401") showBanner("无法连接调度器（agentbar 未运行？）"); }
+}
+
+async function loadTools() {
+  try {
+    const j = await api("/api/tools");
+    $("fTool").innerHTML = j.tools.map(t =>
+      `<option value="${t.name}" ${t.installed ? "" : "disabled"}>${t.display_name}${t.installed ? "" : "（未安装）"}</option>`).join("");
+  } catch (e) {}
+}
+
+window.doAct = async (id, action) => {
+  try { await api(`/api/tasks/${id}/${action}`, { method:"POST" }); refresh(); }
+  catch (e) { alert("操作失败: " + e.message); }
+};
+
+let logTaskId = null, logTimer = null;
+window.openLog = async (id) => {
+  logTaskId = id; $("logWrap").style.display = "block"; $("logTitle").textContent = "日志 · " + id;
+  const pull = async () => {
+    if (!logTaskId) return;
+    try {
+      const j = await api(`/api/tasks/${logTaskId}/log`);
+      const el = $("logBody");
+      const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+      el.textContent = j.log || "(空)";
+      if (stick) el.scrollTop = el.scrollHeight;
+    } catch (e) {}
+  };
+  await pull(); logTimer = setInterval(pull, 2000);
+};
+window.closeLog = () => { logTaskId = null; clearInterval(logTimer); $("logWrap").style.display = "none"; };
+
+$("addForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  try {
+    await api("/api/tasks", { method:"POST", body: JSON.stringify({
+      prompt: $("fPrompt").value, tool: $("fTool").value, cwd: $("fCwd").value,
+      title: $("fTitle").value, profile: $("fProfile").value }) });
+    $("fPrompt").value = ""; $("fTitle").value = ""; refresh();
+  } catch (e) { alert("添加失败: " + e.message); }
+});
+$("btnPause").onclick = () => api("/api/pause-all", { method:"POST" }).then(refresh);
+$("btnResume").onclick = () => api("/api/resume-all", { method:"POST" }).then(refresh);
+
+loadTools(); refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>

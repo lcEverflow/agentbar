@@ -1,0 +1,185 @@
+"""Localhost HTTP API + task manager web UI.
+
+安全：只绑 127.0.0.1；所有 /api（除 /api/ping）要求 token（Header 或 query），
+校验 Host 头防 DNS rebinding。token 存于 state 目录 config.json（0600）。
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import resources
+from urllib.parse import parse_qs, urlparse
+
+from . import __version__
+from .config import Settings
+from .scheduler import Scheduler
+
+log = logging.getLogger("agentbar.server")
+
+MAX_BODY = 200_000
+ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+
+
+class ApiServer:
+    def __init__(self, core: Scheduler, settings: Settings):
+        self.core = core
+        self.settings = settings
+        handler = _make_handler(core, settings)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", settings.port), handler)
+        self.httpd.daemon_threads = True
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        return self.httpd.server_address[1]
+
+    def url(self, with_token: bool = False) -> str:
+        base = f"http://127.0.0.1:{self.port}/"
+        if with_token:
+            base += f"?token={self.settings.token}"
+        return base
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self.httpd.serve_forever, name="agentbar-http", daemon=True
+        )
+        self._thread.start()
+        log.info("api server on %s", self.url())
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _load_index_html() -> str:
+    return (
+        resources.files("agentbar").joinpath("web/index.html").read_text("utf-8")
+    )
+
+
+def _make_handler(core: Scheduler, settings: Settings):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = f"AgentBar/{__version__}"
+
+        # ---------- plumbing ----------
+
+        def log_message(self, fmt, *args):  # 安静，不刷 stderr
+            log.debug("http: " + fmt, *args)
+
+        def _json(self, code: int, obj: dict) -> None:
+            body = json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _html(self, text: str) -> None:
+            body = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _host_ok(self) -> bool:
+            host = (self.headers.get("Host") or "").split(":")[0].lower()
+            return host in ALLOWED_HOSTS
+
+        def _authed(self, query: dict) -> bool:
+            token = self.headers.get("X-Agentbar-Token") or (
+                query.get("token", [""])[0]
+            )
+            return bool(token) and hmac.compare_digest(token, settings.token)
+
+        def _body(self) -> dict:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > MAX_BODY:
+                return {}
+            try:
+                return json.loads(self.rfile.read(n).decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return {}
+
+        # ---------- routing ----------
+
+        def do_GET(self):
+            if not self._host_ok():
+                self._json(403, {"ok": False, "error": "bad host"})
+                return
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            path = u.path.rstrip("/") or "/"
+
+            if path == "/":
+                self._html(_INDEX_HTML)
+                return
+            if path == "/api/ping":
+                self._json(200, {"ok": True, "app": "agentbar", "version": __version__})
+                return
+            if not self._authed(q):
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if path == "/api/state":
+                self._json(200, {"ok": True, **core.snapshot()})
+                return
+            if path == "/api/tools":
+                tools = [a.availability() for a in core.registry.values()]
+                self._json(200, {"ok": True, "tools": tools})
+                return
+            parts = path.split("/")
+            if len(parts) == 5 and parts[1:3] == ["api", "tasks"] and parts[4] == "log":
+                tail = min(int(q.get("tail_bytes", ["30000"])[0]), 200_000)
+                text = core.store.read_log_tail(parts[3], tail)
+                self._json(200, {"ok": True, "log": text})
+                return
+            self._json(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self):
+            if not self._host_ok():
+                self._json(403, {"ok": False, "error": "bad host"})
+                return
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            path = u.path.rstrip("/")
+            if not self._authed(q):
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+            body = self._body()
+
+            if path == "/api/tasks":
+                try:
+                    t = core.add_task(
+                        prompt=body.get("prompt", ""),
+                        tool=body.get("tool", "claude"),
+                        cwd=body.get("cwd", ""),
+                        title=body.get("title"),
+                        profile=body.get("profile", "edits"),
+                    )
+                except ValueError as e:
+                    self._json(400, {"ok": False, "error": str(e)})
+                    return
+                self._json(200, {"ok": True, "task": t.to_dict()})
+                return
+            if path == "/api/pause-all":
+                core.pause_all()
+                self._json(200, {"ok": True})
+                return
+            if path == "/api/resume-all":
+                core.resume_all()
+                self._json(200, {"ok": True})
+                return
+            parts = path.split("/")
+            if len(parts) == 5 and parts[1:3] == ["api", "tasks"]:
+                ok, msg = core.act(parts[3], parts[4])
+                self._json(200 if ok else 400, {"ok": ok, "message": msg, "error": msg})
+                return
+            self._json(404, {"ok": False, "error": "not found"})
+
+    _INDEX_HTML = _load_index_html()
+    return Handler
