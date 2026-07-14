@@ -98,6 +98,8 @@ def to_html(tool: str, path: Path) -> str:
             label = "用户" if role_key == "user" else "Claude"
             css = "u" if role_key == "user" else "a"
             content = (obj.get("message") or {}).get("content", "")
+            if role_key == "user" and _is_pure_tool_result(content):
+                continue  # skip tool-result echo turns
             body_html = _claude_content_to_html(content)
             if body_html:
                 turns.append(f'<div class="turn {css}"><div class="r">{label}</div>{body_html}</div>')
@@ -161,15 +163,52 @@ def _wrap(body: str) -> str:
 
 
 def _is_system_context(content) -> bool:
-    """Return True if this user message is AGENTS.md / system context injection."""
+    """Return True if this user message is a system-injected context block to skip."""
     if not isinstance(content, list):
         return False
-    for block in content[:2]:
+    for block in content[:3]:
         if isinstance(block, dict):
             text = block.get("text") or block.get("input_text") or ""
-            if "# AGENTS.md" in text or "AGENTS.md instructions" in text:
+            if (
+                "# AGENTS.md" in text
+                or "AGENTS.md instructions" in text
+                or text.lstrip().startswith("<environment_context>")
+            ):
                 return True
     return False
+
+
+def _tool_call_summary(name: str, inp: dict) -> str:
+    """Return a compact, human-readable summary of a tool call."""
+    _prefer = {
+        "Write": "file_path", "Read": "file_path", "Edit": "file_path",
+        "Bash": "command", "Grep": "pattern", "Glob": "pattern",
+        "WebFetch": "url", "WebSearch": "query",
+    }
+    key = _prefer.get(name)
+    val = None
+    if key and key in inp:
+        val = str(inp[key])
+    else:
+        for v in inp.values():
+            if isinstance(v, str):
+                val = v
+                break
+    if val:
+        if len(val) > 120:
+            val = val[:117] + "…"
+        return f"{name} · {val}"
+    return name
+
+
+def _is_pure_tool_result(content) -> bool:
+    """True if a user message consists only of tool_result blocks (no real user text)."""
+    if not isinstance(content, list) or not content:
+        return False
+    return all(
+        isinstance(b, dict) and b.get("type") == "tool_result"
+        for b in content
+    )
 
 
 def _claude_content_to_html(content) -> str:
@@ -185,17 +224,17 @@ def _claude_content_to_html(content) -> str:
         if btype == "text":
             parts.append(_text_to_html(block.get("text") or ""))
         elif btype == "thinking":
-            snippet = html.escape((block.get("thinking") or "")[:200])
-            parts.append(f'<div class="think">💭 {snippet}…</div>')
+            raw = block.get("thinking") or ""
+            snippet = html.escape(raw[:300])
+            ellipsis = "…" if len(raw) > 300 else ""
+            parts.append(f'<div class="think">💭 {snippet}{ellipsis}</div>')
         elif btype == "tool_use":
-            name = html.escape(block.get("name") or "?")
-            inp = json.dumps(block.get("input") or {}, ensure_ascii=False)
-            parts.append(f'<div class="tool">→ {name}({html.escape(inp[:200])})</div>')
+            name = block.get("name") or "?"
+            inp = block.get("input") or {}
+            summary = html.escape(_tool_call_summary(name, inp))
+            parts.append(f'<div class="tool">→ {summary}</div>')
         elif btype == "tool_result":
-            c = block.get("content", "")
-            if isinstance(c, list):
-                c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
-            parts.append(f'<div class="tool">← {html.escape(str(c)[:200])}</div>')
+            pass  # pure tool-result turns are skipped at caller; mixed ones ignored here
     return "".join(parts)
 
 
