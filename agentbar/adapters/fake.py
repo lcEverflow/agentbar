@@ -14,6 +14,7 @@ _FAKE_CLI = Path(__file__).resolve().parent.parent / "testing" / "fake_cli.py"
 class FakeAdapter(Adapter):
     name = "fake"
     display_name = "Fake (testing)"
+    effort_choices = ("low", "medium", "high")
 
     def binary(self) -> str | None:
         return sys.executable

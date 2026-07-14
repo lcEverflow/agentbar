@@ -49,6 +49,7 @@ class Task:
     effort: str | None = None
     state: TaskState = TaskState.QUEUED
     created_at: float = field(default_factory=time.time)
+    scheduled_at: float | None = None   # 定时执行：None=立即; future epoch=到时才派发
     started_at: float | None = None
     finished_at: float | None = None
     attempts: int = 0

@@ -79,6 +79,7 @@ class Outcome:
 class Adapter(ABC):
     name: str = ""
     display_name: str = ""
+    effort_choices: tuple[str, ...] = ()
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -122,6 +123,9 @@ class Adapter(ABC):
                 continue
         return None
 
+    def model_suggestions(self) -> list[str]:
+        return []
+
     def availability(self) -> dict:
         b = self.binary()
         return {
@@ -129,6 +133,8 @@ class Adapter(ABC):
             "display_name": self.display_name,
             "installed": bool(b),
             "path": b,
+            "efforts": list(self.effort_choices),
+            "models": self.model_suggestions(),
         }
 
     # ---------- invocation ----------

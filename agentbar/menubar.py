@@ -28,17 +28,12 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory,
     NSMenu,
     NSMenuItem,
-    NSPasteboard,
-    NSPasteboardTypeString,
     NSStatusBar,
     NSVariableStatusItemLength,
-    NSWorkspace,
-    NSWorkspaceOpenConfiguration,
 )
-from Foundation import NSObject, NSTimer, NSURL
+from Foundation import NSObject, NSTimer
 from PyObjCTools import AppHelper
 
-from .browser import open_url_async
 from .config import Settings
 from .menu_spec import build_menu_spec, build_title
 from .scheduler import Scheduler
@@ -99,6 +94,9 @@ class AgentBarApp:
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             TITLE_REFRESH_SECONDS, self._bridge, "onTimer:", None, True
         )
+        # Install main menu so text fields in our windows get Cmd+C/V/X/Z/A,
+        # and Cmd+W closes the front window.
+        self._install_main_menu()
         log.info("menu bar up (AppKit)")
         AppHelper.runEventLoop()
 
@@ -112,6 +110,40 @@ class AgentBarApp:
 
     def _terminate(self) -> None:
         self._nsapp.terminate_(None)
+
+    def _install_main_menu(self) -> None:
+        """Install a minimal main menu so Cmd+C/V/X/Z work in our NSTextView/NSTextField,
+        and Cmd+W closes the front window (nil-target first-responder chain)."""
+        main = NSMenu.alloc().init()
+
+        edit_menu = NSMenu.alloc().initWithTitle_("Edit")
+        for title, sel, key in [
+            ("Undo", "undo:", "z"),
+            ("Redo", "redo:", "Z"),
+            (None, None, None),
+            ("Cut", "cut:", "x"),
+            ("Copy", "copy:", "c"),
+            ("Paste", "paste:", "v"),
+            ("Select All", "selectAll:", "a"),
+        ]:
+            if title is None:
+                edit_menu.addItem_(NSMenuItem.separatorItem())
+            else:
+                it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, key)
+                edit_menu.addItem_(it)
+        edit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Edit", None, "")
+        edit_item.setSubmenu_(edit_menu)
+        main.addItem_(edit_item)
+
+        win_menu = NSMenu.alloc().initWithTitle_("Window")
+        close_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Close Window", "performClose:", "w")
+        win_menu.addItem_(close_it)
+        win_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Window", None, "")
+        win_item.setSubmenu_(win_menu)
+        main.addItem_(win_item)
+
+        self._nsapp.setMainMenu_(main)
 
     # ---------- rendering (main thread only) ----------
 
@@ -169,8 +201,6 @@ class AgentBarApp:
                 self._show_panel(False)
             elif action == "quick_add":
                 self._show_panel(True)
-            elif action == "open_web_panel":
-                self._open(self.server.url(with_token=True))
             elif action == "refresh_quota":
                 self.core.quota.refresh_now()  # 异步：只置事件
             elif action == "authorize_keychain":
@@ -194,51 +224,6 @@ class AgentBarApp:
                 self.core, self.settings, self.server
             )
         self._panel.show_(focus_prompt)
-
-    def _open(self, url: str) -> None:
-        """浏览器打开（次要入口）：NSWorkspace 原生异步优先，失败绝不静默。"""
-        if self._open_native(url):
-            return
-        if not open_url_async(url, on_result=self._on_open_result):
-            self._open_failed(url, "无法启动 /usr/bin/open")
-
-    def _open_native(self, url: str) -> bool:
-        try:
-            ns_url = NSURL.URLWithString_(url)
-            cfg = NSWorkspaceOpenConfiguration.configuration()
-
-            def done(app, err):
-                if err is not None:
-                    reason = str(err.localizedDescription())
-                    log.warning("NSWorkspace open failed: %s", reason)
-                    AppHelper.callAfter(self._open_failed, url, reason)
-                else:
-                    log.info("NSWorkspace opened panel ok")
-
-            NSWorkspace.sharedWorkspace().openURL_configuration_completionHandler_(
-                ns_url, cfg, done
-            )
-            return True
-        except Exception:
-            log.exception("NSWorkspace path unavailable, fallback to /usr/bin/open")
-            return False
-
-    def _on_open_result(self, url: str, rc: int, err: str) -> None:
-        """open_url_async 的后台回调（非主线程）。"""
-        if rc != 0:
-            AppHelper.callAfter(self._open_failed, url, f"open 退出码 {rc} {err[:120]}")
-
-    def _open_failed(self, url: str, reason: str) -> None:
-        copied = False
-        try:
-            pb = NSPasteboard.generalPasteboard()
-            pb.clearContents()
-            pb.setString_forType_(url, NSPasteboardTypeString)
-            copied = True
-        except Exception:
-            log.exception("pasteboard write failed")
-        hint = "面板地址已复制到剪贴板，直接粘贴到浏览器即可。" if copied else ""
-        self._alert("无法自动打开浏览器", f"原因：{reason}\n{hint}\n{url}")
 
     def _authorize_keychain_bg(self) -> None:
         def work():

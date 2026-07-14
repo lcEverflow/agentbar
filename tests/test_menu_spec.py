@@ -90,7 +90,8 @@ def test_keychain_authorize_only_on_keychain_error():
 def test_core_actions_present():
     spec = build_menu_spec(_snap())
     actions = {n["action"] for n in spec if n["kind"] == "action"}
-    assert {"open_panel", "quick_add", "open_web_panel", "quit"} <= actions
+    assert {"open_panel", "quick_add", "quit"} <= actions
+    assert "open_web_panel" not in actions
 
 
 def test_title_shows_usage_percent_when_fresh():

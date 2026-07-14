@@ -10,6 +10,9 @@ from agentbar.browser import open_panel_url
 from agentbar.menubar import AgentBarApp
 
 
+
+
+
 class _FakeQuota:
     def __init__(self):
         self.refreshed = 0
@@ -55,17 +58,6 @@ def test_open_panel_opens_native_window(monkeypatch):
     app._dispatch("quick_add")
     assert time.monotonic() - start < 0.05, "菜单动作必须毫秒级返回"
     assert shown == [False, True]  # quick_add 聚焦 prompt 输入框
-
-
-def test_web_panel_fallback_uses_browser(monkeypatch):
-    app = _app()
-    opened = []
-    # 测试里禁用 NSWorkspace 真打开，强制走可捕获的 open_url_async 降级路径
-    monkeypatch.setattr(AgentBarApp, "_open_native", lambda self, url: False)
-    monkeypatch.setattr("agentbar.menubar.open_url_async",
-                        lambda url, on_result=None: opened.append(url) or True)
-    app._dispatch("open_web_panel")
-    assert opened == ["http://127.0.0.1:8737/?token=abc"]
 
 
 def test_refresh_quota_dispatch_only_sets_event():

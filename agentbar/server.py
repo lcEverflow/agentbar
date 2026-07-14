@@ -148,6 +148,26 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 text = core.store.read_log_tail(parts[3], tail)
                 self._json(200, {"ok": True, "log": text})
                 return
+            if len(parts) == 5 and parts[1:3] == ["api", "tasks"] and parts[4] == "transcript":
+                from .transcript import find_session_file, parse_transcript
+                task_id = parts[3]
+                with core._lock:
+                    t = core._tasks.get(task_id)
+                if not t:
+                    self._json(404, {"ok": False, "error": "任务不存在"})
+                    return
+                if not t.session_id:
+                    self._json(200, {"ok": True, "transcript": "", "message": "该任务尚无会话 ID"})
+                    return
+                path = find_session_file(t.tool, t.cwd, t.session_id)
+                if not path:
+                    self._json(200, {"ok": True, "transcript": "",
+                                     "message": f"未找到会话文件（sid={t.session_id}）"})
+                    return
+                text = parse_transcript(t.tool, path)
+                self._json(200, {"ok": True, "transcript": text,
+                                 "session_id": t.session_id, "path": str(path)})
+                return
             self._json(404, {"ok": False, "error": "not found"})
 
         def do_POST(self):
@@ -172,6 +192,7 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                         profile=body.get("profile", "edits"),
                         model=body.get("model"),
                         effort=body.get("effort"),
+                        scheduled_at=body.get("scheduled_at"),
                     )
                 except ValueError as e:
                     self._json(400, {"ok": False, "error": str(e)})
@@ -207,8 +228,7 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                     self._json(404, {"ok": False,
                                      "error": "menu bar 未运行（headless 无此通道）"})
                     return
-                if action not in {"open_panel", "quick_add", "refresh_quota",
-                                  "open_web_panel"}:
+                if action not in {"open_panel", "quick_add", "refresh_quota"}:
                     self._json(400, {"ok": False, "error": f"action 不在白名单: {action!r}"})
                     return
                 fn(action)

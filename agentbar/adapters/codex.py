@@ -8,7 +8,9 @@ session id 从输出 banner 的 `session id: <uuid>` 行提取。
 from __future__ import annotations
 
 import json
+import os
 import re
+from pathlib import Path
 
 from ..models import Task
 from .base import Adapter, Outcome, looks_like_quota, parse_reset_hint
@@ -17,10 +19,36 @@ _SESSION_RE = re.compile(
     r"session[ _]?id:?\s*([0-9a-fA-F][0-9a-fA-F-]{15,})", re.IGNORECASE
 )
 
+_CODEX_MODELS = [
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.1-codex-max",
+]
+
 
 class CodexAdapter(Adapter):
     name = "codex"
     display_name = "Codex CLI"
+    effort_choices = ("minimal", "low", "medium", "high", "xhigh")
+
+    def model_suggestions(self) -> list[str]:
+        # Put the user's configured model first if available
+        try:
+            codex_home = os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+            cfg_text = (Path(codex_home) / "config.toml").read_text()
+            m = re.search(r'^model\s*=\s*"([^"]+)"', cfg_text, re.MULTILINE)
+            if m:
+                current = m.group(1)
+                return [current] + [x for x in _CODEX_MODELS if x != current]
+        except Exception:
+            pass
+        return list(_CODEX_MODELS)
 
     def _sandbox_flags(self, task: Task) -> list[str]:
         if task.profile == "readonly":

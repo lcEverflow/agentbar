@@ -15,9 +15,28 @@ from .base import Adapter, Outcome, looks_like_quota, parse_reset_hint
 READONLY_TOOLS = "Read,Glob,Grep,WebFetch,WebSearch,TodoWrite"
 
 
+_CLAUDE_MODELS = [
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "claude-3-7-sonnet-latest",
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-haiku-latest",
+    "opus",
+    "sonnet",
+    "haiku",
+]
+
+
 class ClaudeAdapter(Adapter):
     name = "claude"
     display_name = "Claude Code"
+    effort_choices = ("low", "medium", "high", "xhigh", "max")
+
+    def model_suggestions(self) -> list[str]:
+        return list(_CLAUDE_MODELS)
 
     def build_argv(self, task: Task, resume: bool, binary: str) -> list[str]:
         argv = [binary, "-p", "--output-format", "json"]

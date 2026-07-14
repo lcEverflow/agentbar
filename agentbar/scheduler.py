@@ -19,7 +19,6 @@ from . import __version__
 from .adapters.base import Outcome, get_registry
 from .config import Settings
 from .models import (
-    EFFORTS,
     FINISHED_STATES,
     PROFILES,
     Task,
@@ -158,6 +157,7 @@ class Scheduler:
         profile: str = "edits",
         model: str | None = None,
         effort: str | None = None,
+        scheduled_at: float | None = None,
     ) -> Task:
         prompt = (prompt or "").strip()
         if not prompt:
@@ -177,8 +177,11 @@ class Scheduler:
         if model and (len(model) > 120 or any(c in model for c in "\r\n\x00")):
             raise ValueError("模型名称无效（最多 120 个字符，不能包含换行）")
         effort = (effort or "").strip().lower() or None
-        if effort and effort not in EFFORTS:
-            raise ValueError(f"未知强度档位 {effort!r}，可用: {EFFORTS}")
+        adapter = self.registry[tool]
+        if effort and adapter.effort_choices and effort not in adapter.effort_choices:
+            raise ValueError(
+                f"{tool} 不支持强度 {effort!r}，可用: {adapter.effort_choices}"
+            )
         cwd = os.path.abspath(os.path.expanduser(cwd or self.settings.default_cwd))
         if not os.path.isdir(cwd):
             raise ValueError(f"工作目录不存在: {cwd}")
@@ -191,6 +194,7 @@ class Scheduler:
             profile=profile,
             model=model,
             effort=effort,
+            scheduled_at=scheduled_at if scheduled_at and scheduled_at > time.time() else None,
         )
         with self._lock:
             self._tasks[t.id] = t
@@ -239,8 +243,11 @@ class Scheduler:
             if model and (len(model) > 120 or any(c in model for c in "\r\n\x00")):
                 raise ValueError("模型名称无效（最多 120 个字符，不能包含换行）")
             effort = (changes.get("effort", t.effort) or "").strip().lower() or None
-            if effort and effort not in EFFORTS:
-                raise ValueError(f"未知强度档位 {effort!r}，可用: {EFFORTS}")
+            adapter = self.registry[tool]
+            if effort and adapter.effort_choices and effort not in adapter.effort_choices:
+                raise ValueError(
+                    f"{tool} 不支持强度 {effort!r}，可用: {adapter.effort_choices}"
+                )
 
             cwd = os.path.abspath(os.path.expanduser(changes.get("cwd", t.cwd) or self.settings.default_cwd))
             if not os.path.isdir(cwd):
@@ -454,11 +461,13 @@ class Scheduler:
                     t.state = TaskState.QUEUED
                     t.state_reason = "额度等待结束，重新排队"
                     dirty = True
-            # 2) FIFO 派发（跳过被额度冷却/并发上限卡住的任务）
+            # 2) FIFO 派发（跳过被额度冷却/并发上限/定时卡住的任务）
             if not self._paused:
                 for t in self._iter_tasks():
                     if t.state != TaskState.QUEUED:
                         continue
+                    if t.scheduled_at and t.scheduled_at > now:
+                        continue  # 定时任务：时间未到
                     if len(self._running) >= self.settings.max_parallel:
                         break
                     if self._tool_running(t.tool) >= self.settings.per_tool_limit:
