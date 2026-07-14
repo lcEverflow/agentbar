@@ -556,10 +556,26 @@ class Scheduler:
                     except (BrokenPipeError, OSError):
                         pass
                 deadline = time.time() + timeout
+                next_sid_probe = time.time() + 2.0
+                sid_captured = False
                 while True:
                     rc = proc.poll()
                     if rc is not None:
                         break
+                    # 运行中即捕获 session id（codex 打在输出 header）：
+                    # 「查看对话」对运行中任务立即可用，也防长输出把 header 挤出 tail
+                    if not sid_captured and time.time() >= next_sid_probe:
+                        next_sid_probe = time.time() + 2.0
+                        sid_early = adapter.extract_session_id(
+                            self.store.read_log_head(task_id)
+                        )
+                        if sid_early:
+                            sid_captured = True
+                            with self._lock:
+                                t_live = self._tasks.get(task_id)
+                                if t_live and not t_live.session_id:
+                                    t_live.session_id = sid_early
+                                    self._persist_locked()
                     if run.cancel.is_set():
                         self._terminate(proc)
                         if run.mode == "interrupt":
@@ -592,7 +608,9 @@ class Scheduler:
 
         tail = self.store.read_log_tail(task_id)
         outcome = adapter.classify(rc, tail)
-        sid = adapter.extract_session_id(tail)
+        # 头+尾都扫：codex 的 session id 在输出开头，长输出下 tail 看不到它
+        head = self.store.read_log_head(task_id)
+        sid = adapter.extract_session_id(head + "\n" + tail)
         self._finalize(task_id, run, outcome, rc, sid, tail)
 
     @staticmethod

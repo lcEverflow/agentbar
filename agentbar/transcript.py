@@ -64,6 +64,74 @@ def find_session_file(tool: str, cwd: str | None, session_id: str) -> Path | Non
     return None
 
 
+_ROLLOUT_RE = re.compile(
+    r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(.+)\.jsonl$"
+)
+
+
+def recover_session_id(
+    tool: str, cwd: str,
+    started_at: float | None, finished_at: float | None = None,
+) -> str | None:
+    """按时间窗 + cwd 模糊匹配会话文件，恢复丢失的 session id。
+
+    历史任务可能没存下 session id（旧版只扫输出尾部，codex 的 id 在开头，
+    长输出会被挤出缓冲）。会话文件的创建时间与任务启动时间只差几秒，
+    以此反查。codex 用 rollout 文件名内嵌的本地时间戳，claude 用文件 mtime。
+    """
+    if not started_at:
+        return None
+    lo = started_at - 120
+    hi = (finished_at or started_at + 7200) + 300
+
+    if tool == "codex":
+        best = None
+        for p in glob.glob(
+            str(Path.home() / ".codex" / "sessions" / "**" / "rollout-*.jsonl"),
+            recursive=True,
+        ):
+            m = _ROLLOUT_RE.search(os.path.basename(p))
+            if not m:
+                continue
+            try:
+                ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H-%M-%S"))
+            except ValueError:
+                continue
+            if not (lo <= ts <= hi):
+                continue
+            # cwd 吻合的候选优先，其次时间最接近任务启动的
+            key = (0 if _codex_cwd_matches(p, cwd) else 1, abs(ts - started_at))
+            if best is None or key < best[0]:
+                best = (key, m.group(2))
+        return best[1] if best else None
+
+    if tool == "claude" and cwd:
+        cwd_key = cwd.replace("/", "-")
+        cands = []
+        for p in glob.glob(str(Path.home() / ".claude" / "projects" / cwd_key / "*.jsonl")):
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if lo <= mt <= hi:
+                cands.append((abs(mt - (finished_at or started_at)), Path(p).stem))
+        return min(cands)[1] if cands else None
+    return None
+
+
+def _codex_cwd_matches(path: str, cwd: str) -> bool:
+    """codex 会话头部记录了 cwd（注意 /tmp → /private/tmp 符号链接归一）。"""
+    if not cwd:
+        return False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    real = os.path.realpath(os.path.expanduser(cwd))
+    return cwd in head or real in head
+
+
 def resume_command(tool: str, cwd: str, session_id: str) -> str:
     if tool == "claude":
         return f"cd {cwd} && claude --resume {session_id}"

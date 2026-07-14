@@ -51,6 +51,17 @@ class StateStore:
     def log_path(self, task_id: str) -> Path:
         return self.logs_dir / f"{task_id}.log"
 
+    def read_log_head(self, task_id: str, max_bytes: int = 16384) -> str:
+        """输出开头（codex 的 session id 打在 header，长输出会被挤出 tail）。"""
+        p = self.log_path(task_id)
+        if not p.exists():
+            return ""
+        try:
+            with open(p, "rb") as f:
+                return f.read(max_bytes).decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
     def read_log_tail(self, task_id: str, max_bytes: int = 65536) -> str:
         p = self.log_path(task_id)
         if not p.exists():

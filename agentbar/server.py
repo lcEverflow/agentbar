@@ -217,13 +217,24 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 self._json(200, {"ok": True, "log": text})
                 return
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"] and parts[4] == "transcript":
-                from .transcript import find_session_file, parse_transcript
+                from .transcript import (
+                    find_session_file,
+                    parse_transcript,
+                    recover_session_id,
+                )
                 task_id = parts[3]
                 with core._lock:
                     t = core._tasks.get(task_id)
                 if not t:
                     self._json(404, {"ok": False, "error": "任务不存在"})
                     return
+                if not t.session_id:
+                    sid = recover_session_id(t.tool, t.cwd, t.started_at, t.finished_at)
+                    if sid:
+                        with core._lock:
+                            if not t.session_id:
+                                t.session_id = sid
+                                core._persist_locked()
                 if not t.session_id:
                     self._json(200, {"ok": True, "transcript": "", "message": "该任务尚无会话 ID"})
                     return

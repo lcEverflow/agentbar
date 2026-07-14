@@ -454,8 +454,29 @@ class PanelWindowController(NSObject):
             self._alert("未选中任务", "请先在任务列表中选择一行。")
             return
         if not t.get("session_id"):
-            self._alert("无会话记录", "该任务尚无会话 ID（可能还未开始运行或工具不支持）。")
-            return
+            # 历史任务可能丢了 session id（旧版只扫输出尾部）→ 按时间窗反查恢复
+            from .transcript import recover_session_id
+            sid = recover_session_id(
+                t.get("tool", ""), t.get("cwd", ""),
+                t.get("started_at"), t.get("finished_at"),
+            )
+            if sid:
+                t = {**t, "session_id": sid}
+                try:
+                    with self.core._lock:
+                        live = self.core._tasks.get(t["id"])
+                        if live and not live.session_id:
+                            live.session_id = sid
+                            self.core._persist_locked()
+                except Exception:
+                    log.exception("persist recovered sid failed")
+            else:
+                self._alert(
+                    "无会话记录",
+                    "该任务尚无会话 ID，且按时间反查也未找到会话文件"
+                    "（可能还未开始运行或工具不支持）。",
+                )
+                return
         self._open_transcript_window(t)
 
     @objc.python_method
