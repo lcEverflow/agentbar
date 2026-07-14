@@ -44,6 +44,30 @@ log = logging.getLogger("agentbar.menubar")
 TITLE_REFRESH_SECONDS = 2.0
 
 
+def _qr_page_html(url: str) -> str:
+    """Generate the QR window HTML (SVG QR, no PIL dependency)."""
+    import qrcode
+    import qrcode.image.svg
+
+    img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage)
+    svg = img.to_string().decode()
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body{{font-family:-apple-system,sans-serif;margin:0;padding:20px;text-align:center;
+     background:#fff;color:#1c1c1e}}
+svg{{width:280px;height:280px;display:block;margin:8px auto}}
+h3{{margin:4px 0 2px;font-size:15px}}
+p{{font-size:12px;color:#8e8e93;margin:4px 0}}
+.url{{font-size:11px;font-family:Menlo,monospace;word-break:break-all;
+     background:#f2f2f7;border-radius:8px;padding:8px;margin-top:10px;
+     user-select:all;-webkit-user-select:all}}
+</style></head><body>
+<h3>手机扫码 · 查看/提交任务</h3>
+<p>手机需与 Mac 连同一 Wi-Fi；链接含访问令牌，勿外传</p>
+{svg}
+<div class="url">{url}</div>
+</body></html>"""
+
+
 class _Bridge(NSObject):
     """Objective-C 桥：菜单 delegate + action/timer target（只在主线程被调用）。"""
 
@@ -75,6 +99,7 @@ class AgentBarApp:
         self._menu = None
         self._timer = None
         self._panel = None  # 原生任务面板窗口（懒加载）
+        self._qr_window = None  # 手机访问二维码窗口（懒加载）
 
     # ---------- lifecycle ----------
 
@@ -209,6 +234,8 @@ class AgentBarApp:
                 self.core.pause_all()
             elif action == "resume_all":
                 self.core.resume_all()
+            elif action == "mobile_qr":
+                self._show_mobile_qr()
             elif action == "quit":
                 self._quit()
         except Exception:
@@ -224,6 +251,48 @@ class AgentBarApp:
                 self.core, self.settings, self.server
             )
         self._panel.show_(focus_prompt)
+
+    def _show_mobile_qr(self) -> None:
+        """手机扫码窗口：二维码指向 http://<LAN IP>:<port>/m?token=…（同一 Wi-Fi 可达）。"""
+        url = self.server.mobile_url()
+        if not url:
+            self._alert(
+                "手机访问",
+                "未获取到局域网 IP（Mac 未联网？），或 config.json 中 lan_access 已关闭。",
+            )
+            return
+        if self._qr_window is not None and self._qr_window.isVisible():
+            self._qr_window.makeKeyAndOrderFront_(None)
+            self._nsapp.activateIgnoringOtherApps_(True)
+            return
+        try:
+            page = _qr_page_html(url)
+            from AppKit import (
+                NSBackingStoreBuffered,
+                NSMakeRect,
+                NSWindow,
+                NSWindowStyleMaskClosable,
+                NSWindowStyleMaskTitled,
+            )
+            from WebKit import WKWebView
+
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, 360, 470),
+                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+                NSBackingStoreBuffered, False,
+            )
+            win.setTitle_("手机访问 AgentBar")
+            win.setReleasedWhenClosed_(False)
+            win.center()
+            wv = WKWebView.alloc().initWithFrame_(NSMakeRect(0, 0, 360, 470))
+            wv.loadHTMLString_baseURL_(page, None)
+            win.contentView().addSubview_(wv)
+            self._qr_window = win
+            win.makeKeyAndOrderFront_(None)
+            self._nsapp.activateIgnoringOtherApps_(True)
+        except Exception:
+            log.exception("qr window failed")
+            self._alert("手机访问", f"二维码窗口创建失败；手机浏览器直接打开：\n{url}")
 
     def _authorize_keychain_bg(self) -> None:
         def work():

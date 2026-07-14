@@ -5,3 +5,7 @@ __pycache__/
 dist/
 *.egg-info/
 .DS_Store
+.build-venv/
+packaging/build/
+packaging/dist/
+packaging/.eggs/

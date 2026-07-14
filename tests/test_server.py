@@ -58,11 +58,41 @@ def test_dns_rebinding_blocked(api):
     assert code == 403
 
 
+def test_lan_ip_host_allowed(api):
+    """lan_access 模式下 IP 字面量 Host 放行（手机以 http://10.x… 访问）。"""
+    srv, s = api
+    code, j = _call(srv, "/api/state", token=s.token, host="172.20.118.198:8737")
+    assert code == 200 and j["ok"]
+    # IPv6 字面量
+    code, _ = _call(srv, "/api/ping", host="[fe80::1]:8737")
+    assert code == 200
+
+
+def test_lan_host_rejected_when_disabled(core, settings):
+    settings.port = 0
+    settings.lan_access = False
+    srv = ApiServer(core, settings)
+    srv.start()
+    try:
+        code, _ = _call(srv, "/api/ping", host="172.20.118.198:8737")
+        assert code == 403
+    finally:
+        srv.stop()
+
+
 def test_index_served(api):
     srv, _ = api
     with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/", timeout=5) as r:
         assert r.status == 200
         assert "AgentBar" in r.read().decode()
+
+
+def test_mobile_page_served(api):
+    srv, _ = api
+    with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/m", timeout=5) as r:
+        assert r.status == 200
+        body = r.read().decode()
+        assert "AgentBar" in body and "agentbar_token" in body
 
 
 def test_add_task_and_lifecycle_via_api(api, core, tmp_path):

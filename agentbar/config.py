@@ -32,6 +32,7 @@ class Settings:
     usage_refresh_seconds: int = 120    # 订阅额度接口轮询间隔（最小 30 秒）
     tick_seconds: float = 1.0
     tool_paths: dict = field(default_factory=dict)  # 手动指定 CLI 路径: {"claude": "/path"}
+    lan_access: bool = True        # 绑定 0.0.0.0 供同一局域网的手机访问（API 仍需 token）
     token: str = ""
 
     @property
@@ -49,6 +50,7 @@ _PERSISTED_KEYS = (
     "backoff_minutes",
     "usage_refresh_seconds",
     "tool_paths",
+    "lan_access",
     "token",
 )
 

@@ -1,14 +1,18 @@
-"""Localhost HTTP API + task manager web UI.
+"""Localhost HTTP API + task manager web UI (+ optional LAN access for mobile).
 
-安全：只绑 127.0.0.1；所有 /api（除 /api/ping）要求 token（Header 或 query），
-校验 Host 头防 DNS rebinding。token 存于 state 目录 config.json（0600）。
+安全：默认绑 127.0.0.1；lan_access=true 时绑 0.0.0.0 供同局域网手机访问。
+所有 /api（除 /api/ping）要求 token（Header 或 query）。Host 头校验只放行
+IP 字面量（DNS rebinding 必须借助域名，放行裸 IP 不破坏该防御）。
+token 存于 state 目录 config.json（0600）。
 """
 
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import logging
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
@@ -24,6 +28,35 @@ MAX_BODY = 200_000
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 
 
+def _host_of(header: str) -> str:
+    """Extract host part from a Host header ([::1]:8737 / 10.1.2.3:8737 / localhost)."""
+    header = header or ""
+    if header.startswith("["):
+        return header[1:].split("]")[0].lower()
+    return header.split(":")[0].lower()
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def lan_ip() -> str | None:
+    """Best-effort LAN IP：UDP connect 只选路由不发包，离线也不阻塞。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        return None if ip.startswith("127.") else ip
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 class ApiServer:
     def __init__(self, core: Scheduler, settings: Settings):
         self.core = core
@@ -31,7 +64,8 @@ class ApiServer:
         # menu bar 进程注入：把 action 转发到主线程菜单分发器（调试/远程触发用）
         self.hooks: dict = {"dispatch": None}
         handler = _make_handler(core, settings, self.hooks)
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", settings.port), handler)
+        bind = "0.0.0.0" if settings.lan_access else "127.0.0.1"
+        self.httpd = ThreadingHTTPServer((bind, settings.port), handler)
         self.httpd.daemon_threads = True
         self._thread: threading.Thread | None = None
 
@@ -52,6 +86,15 @@ class ApiServer:
             params["token"] = self.settings.token
         return base + (f"?{urlencode(params)}" if params else "")
 
+    def mobile_url(self) -> str | None:
+        """手机可扫的 LAN 地址（带 token）；未启用 LAN 或取不到 IP 时返回 None。"""
+        if not self.settings.lan_access:
+            return None
+        ip = lan_ip()
+        if not ip:
+            return None
+        return f"http://{ip}:{self.port}/m?token={self.settings.token}"
+
     def start(self) -> None:
         self._thread = threading.Thread(
             target=self.httpd.serve_forever, name="agentbar-http", daemon=True
@@ -64,10 +107,8 @@ class ApiServer:
         self.httpd.server_close()
 
 
-def _load_index_html() -> str:
-    return (
-        resources.files("agentbar").joinpath("web/index.html").read_text("utf-8")
-    )
+def _load_web(name: str) -> str:
+    return resources.files("agentbar").joinpath(f"web/{name}").read_text("utf-8")
 
 
 def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None):
@@ -98,8 +139,12 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             self.wfile.write(body)
 
         def _host_ok(self) -> bool:
-            host = (self.headers.get("Host") or "").split(":")[0].lower()
-            return host in ALLOWED_HOSTS
+            host = _host_of(self.headers.get("Host"))
+            if host in ALLOWED_HOSTS:
+                return True
+            # LAN 模式放行 IP 字面量（手机浏览器以 http://10.x.x.x:8737 访问）。
+            # 域名一律拒绝：DNS rebinding 攻击必须经由域名。
+            return settings.lan_access and _is_ip_literal(host)
 
         def _authed(self, query: dict) -> bool:
             token = self.headers.get("X-Agentbar-Token") or (
@@ -129,6 +174,9 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             if path == "/":
                 self._html(_INDEX_HTML)
                 return
+            if path == "/m":
+                self._html(_MOBILE_HTML)
+                return
             if path == "/api/ping":
                 self._json(200, {"ok": True, "app": "agentbar", "version": __version__})
                 return
@@ -140,7 +188,9 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 return
             if path == "/api/tools":
                 tools = [a.availability() for a in core.registry.values()]
-                self._json(200, {"ok": True, "tools": tools})
+                self._json(200, {"ok": True, "tools": tools,
+                                 "default_cwd": settings.default_cwd,
+                                 "allow_full_profile": settings.allow_full_profile})
                 return
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"] and parts[4] == "log":
@@ -263,5 +313,6 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 return
             self._json(200, {"ok": True, "task": t.to_dict()})
 
-    _INDEX_HTML = _load_index_html()
+    _INDEX_HTML = _load_web("index.html")
+    _MOBILE_HTML = _load_web("mobile.html")
     return Handler

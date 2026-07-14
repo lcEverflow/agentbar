@@ -142,6 +142,7 @@ def build_menu_spec(snapshot: dict) -> list[dict]:
 
     rows.append(_action("↗ 打开任务面板", "open_panel"))
     rows.append(_action("＋ 快速添加任务…", "quick_add"))
+    rows.append(_action("📱 手机访问（扫码）…", "mobile_qr"))
     rows.append(_sep())
     if snapshot.get("paused"):
         rows.append(_action("▶ 恢复任务派发", "resume_all"))

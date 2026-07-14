@@ -1,6 +1,6 @@
 [project]
 name = "agentbar"
-version = "0.4.0"
+version = "0.7.0"
 description = "macOS menu bar scheduler for AI CLI agents (Claude Code, Codex, ...)"
 requires-python = ">=3.11"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     # Claude Code OAuth 凭据存于 macOS 登录 Keychain，需要 Security 框架。
     "pyobjc-framework-Security>=11.0; sys_platform == 'darwin'",
     "pyobjc-framework-webkit>=12.2.1",
+    "qrcode>=8.2",
 ]
 
 [project.scripts]
