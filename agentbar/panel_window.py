@@ -542,6 +542,15 @@ class PanelWindowController(NSObject):
         if not wkview:
             return
 
+        # Skip reload if file hasn't changed since last load — preserves scroll position
+        cur_mtime = path.stat().st_mtime if path else None
+        if (cur_mtime is not None
+                and cur_mtime == meta.get("_mtime")
+                and sid == meta.get("_loaded_sid")):
+            return
+        meta["_mtime"] = cur_mtime
+        meta["_loaded_sid"] = sid
+
         try:
             from WebKit import WKWebView
             if isinstance(wkview, WKWebView):
@@ -550,7 +559,6 @@ class PanelWindowController(NSObject):
                 else:
                     content = f"<p style='color:#888;padding:16px'>未找到会话文件<br>session_id: {sid}<br>工具: {tool}<br>目录: {cwd}</p>"
                     content = f"<!DOCTYPE html><html><body style='font-family:-apple-system'>{content}</body></html>"
-                from Foundation import NSURL
                 wkview.loadHTMLString_baseURL_(content, None)
                 return
         except Exception:

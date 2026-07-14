@@ -57,10 +57,15 @@ def build_title(snapshot: dict) -> str:
     claude = (snapshot.get("quota") or {}).get("claude") or {}
     fetched = claude.get("fetched_at")
     windows = claude.get("windows") or []
+    state = claude.get("state", "")
     if windows and fetched and time.time() - fetched < TITLE_USAGE_STALE:
         primary = windows[0]
         if primary.get("used_percent") is not None:
             parts.append(f"{primary['used_percent']:.0f}%")
+    elif state == "limited":
+        parts.append("限额")
+    elif state == "ok" and fetched and time.time() - fetched < TITLE_USAGE_STALE:
+        parts.append("Claude✓")
     return " ".join(parts)
 
 
