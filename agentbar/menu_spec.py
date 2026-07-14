@@ -104,6 +104,26 @@ def _quota_submenu(tool: str, qi: dict) -> dict:
     return _submenu(f"{dot} {tool.capitalize()} · {_quota_compact(qi)}", children)
 
 
+def _mobile_submenu(t: dict) -> dict:
+    """手机访问子菜单：局域网扫码 + 公网隧道（按隧道状态变形）。"""
+    children = [_action("📶 局域网扫码（同一 Wi-Fi）…", "mobile_qr")]
+    state = t.get("state", "off")
+    if state == "up":
+        children.append(_action("🌐 公网扫码（已开通）…", "tunnel_qr"))
+        children.append(_action("✕ 停止公网访问", "tunnel_stop"))
+    elif state == "starting":
+        children.append(_info("⏳ 公网隧道启动中…"))
+    else:
+        if t.get("installed", True):
+            children.append(_action("🌐 开通公网访问（外出可用）…", "tunnel_start"))
+        else:
+            children.append(_info("需先安装: brew install cloudflared"))
+        if state == "error" and t.get("error"):
+            children.append(_info(f"⚠ {t['error'][:60]}"))
+    label = {"up": "📱 手机访问 · 🌐公网已开通", "starting": "📱 手机访问 · 启动中…"}
+    return _submenu(label.get(state, "📱 手机访问"), children)
+
+
 def build_menu_spec(snapshot: dict) -> list[dict]:
     rows: list[dict] = []
     status = snapshot.get("status", "idle")
@@ -142,7 +162,7 @@ def build_menu_spec(snapshot: dict) -> list[dict]:
 
     rows.append(_action("↗ 打开任务面板", "open_panel"))
     rows.append(_action("＋ 快速添加任务…", "quick_add"))
-    rows.append(_action("📱 手机访问（扫码）…", "mobile_qr"))
+    rows.append(_mobile_submenu(snapshot.get("tunnel") or {}))
     rows.append(_sep())
     if snapshot.get("paused"):
         rows.append(_action("▶ 恢复任务派发", "resume_all"))

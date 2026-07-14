@@ -38,9 +38,20 @@ class _FakeCore:
 
 
 class _FakeServer:
+    port = 8737
+
+    def __init__(self):
+        self.hooks = {}
+
     def url(self, with_token=False, **query):
         q = "&".join(f"{k}={v}" for k, v in sorted(query.items()))
         return f"http://127.0.0.1:8737/?token=abc" + (f"&{q}" if q else "")
+
+    def allow_host(self, host):
+        pass
+
+    def disallow_host(self, host):
+        pass
 
 
 def _app():

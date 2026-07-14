@@ -63,7 +63,9 @@ class ApiServer:
         self.settings = settings
         # menu bar 进程注入：把 action 转发到主线程菜单分发器（调试/远程触发用）
         self.hooks: dict = {"dispatch": None}
-        handler = _make_handler(core, settings, self.hooks)
+        # 动态 Host 白名单（公网隧道域名启动后注册进来；其余域名一律 403）
+        self.extra_hosts: set[str] = set()
+        handler = _make_handler(core, settings, self.hooks, self.extra_hosts)
         bind = "0.0.0.0" if settings.lan_access else "127.0.0.1"
         self.httpd = ThreadingHTTPServer((bind, settings.port), handler)
         self.httpd.daemon_threads = True
@@ -85,6 +87,12 @@ class ApiServer:
         if with_token:
             params["token"] = self.settings.token
         return base + (f"?{urlencode(params)}" if params else "")
+
+    def allow_host(self, hostname: str) -> None:
+        self.extra_hosts.add(hostname.lower())
+
+    def disallow_host(self, hostname: str) -> None:
+        self.extra_hosts.discard(hostname.lower())
 
     def mobile_url(self) -> str | None:
         """手机可扫的 LAN 地址（带 token）；未启用 LAN 或取不到 IP 时返回 None。"""
@@ -111,8 +119,10 @@ def _load_web(name: str) -> str:
     return resources.files("agentbar").joinpath(f"web/{name}").read_text("utf-8")
 
 
-def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None):
+def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None,
+                  extra_hosts: set | None = None):
     hooks = hooks if hooks is not None else {}
+    extra_hosts = extra_hosts if extra_hosts is not None else set()
     class Handler(BaseHTTPRequestHandler):
         server_version = f"AgentBar/{__version__}"
 
@@ -140,10 +150,11 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
 
         def _host_ok(self) -> bool:
             host = _host_of(self.headers.get("Host"))
-            if host in ALLOWED_HOSTS:
+            if host in ALLOWED_HOSTS or host in extra_hosts:
                 return True
             # LAN 模式放行 IP 字面量（手机浏览器以 http://10.x.x.x:8737 访问）。
-            # 域名一律拒绝：DNS rebinding 攻击必须经由域名。
+            # 其余域名一律拒绝：DNS rebinding 攻击必须经由域名；
+            # 公网隧道域名走 extra_hosts 动态注册。
             return settings.lan_access and _is_ip_literal(host)
 
         def _authed(self, query: dict) -> bool:
@@ -184,7 +195,14 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 self._json(401, {"ok": False, "error": "unauthorized"})
                 return
             if path == "/api/state":
-                self._json(200, {"ok": True, **core.snapshot()})
+                snap = core.snapshot()
+                tstat = hooks.get("tunnel_status")
+                if tstat:
+                    try:
+                        snap["tunnel"] = tstat()
+                    except Exception:
+                        pass
+                self._json(200, {"ok": True, **snap})
                 return
             if path == "/api/tools":
                 tools = [a.availability() for a in core.registry.values()]
@@ -278,7 +296,8 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                     self._json(404, {"ok": False,
                                      "error": "menu bar 未运行（headless 无此通道）"})
                     return
-                if action not in {"open_panel", "quick_add", "refresh_quota"}:
+                if action not in {"open_panel", "quick_add", "refresh_quota",
+                                  "tunnel_start", "tunnel_stop"}:
                     self._json(400, {"ok": False, "error": f"action 不在白名单: {action!r}"})
                     return
                 fn(action)

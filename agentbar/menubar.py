@@ -44,7 +44,7 @@ log = logging.getLogger("agentbar.menubar")
 TITLE_REFRESH_SECONDS = 2.0
 
 
-def _qr_page_html(url: str) -> str:
+def _qr_page_html(url: str, mode: str = "局域网", note: str = "") -> str:
     """Generate the QR window HTML (SVG QR, no PIL dependency)."""
     import qrcode
     import qrcode.image.svg
@@ -61,8 +61,8 @@ p{{font-size:12px;color:#8e8e93;margin:4px 0}}
      background:#f2f2f7;border-radius:8px;padding:8px;margin-top:10px;
      user-select:all;-webkit-user-select:all}}
 </style></head><body>
-<h3>手机扫码 · 查看/提交任务</h3>
-<p>手机需与 Mac 连同一 Wi-Fi；链接含访问令牌，勿外传</p>
+<h3>手机扫码 · 查看/提交任务（{mode}）</h3>
+<p>{note or "链接含访问令牌，勿外传"}</p>
 {svg}
 <div class="url">{url}</div>
 </body></html>"""
@@ -99,7 +99,13 @@ class AgentBarApp:
         self._menu = None
         self._timer = None
         self._panel = None  # 原生任务面板窗口（懒加载）
-        self._qr_window = None  # 手机访问二维码窗口（懒加载）
+        self._qr_window = None   # 手机访问二维码窗口（懒加载）
+        self._qr_webview = None  # 二维码窗口里的 WKWebView（内容可切换 LAN/公网）
+        from .tunnel import TunnelManager
+        self.tunnel = TunnelManager(
+            server.port, on_up=server.allow_host, on_down=server.disallow_host
+        )
+        server.hooks["tunnel_status"] = self.tunnel.status  # /api/state 附带隧道状态
 
     # ---------- lifecycle ----------
 
@@ -174,7 +180,9 @@ class AgentBarApp:
 
     def _snapshot(self) -> dict | None:
         try:
-            return self.core.snapshot()
+            snap = self.core.snapshot()
+            snap["tunnel"] = self.tunnel.status()
+            return snap
         except Exception:
             log.exception("snapshot failed")
             return None
@@ -236,6 +244,12 @@ class AgentBarApp:
                 self.core.resume_all()
             elif action == "mobile_qr":
                 self._show_mobile_qr()
+            elif action == "tunnel_start":
+                self._start_tunnel_bg()
+            elif action == "tunnel_qr":
+                self._show_tunnel_qr()
+            elif action == "tunnel_stop":
+                threading.Thread(target=self.tunnel.stop, daemon=True).start()
             elif action == "quit":
                 self._quit()
         except Exception:
@@ -253,7 +267,7 @@ class AgentBarApp:
         self._panel.show_(focus_prompt)
 
     def _show_mobile_qr(self) -> None:
-        """手机扫码窗口：二维码指向 http://<LAN IP>:<port>/m?token=…（同一 Wi-Fi 可达）。"""
+        """局域网扫码：http://<LAN IP>:<port>/m?token=…（手机与 Mac 同一 Wi-Fi）。"""
         url = self.server.mobile_url()
         if not url:
             self._alert(
@@ -261,12 +275,34 @@ class AgentBarApp:
                 "未获取到局域网 IP（Mac 未联网？），或 config.json 中 lan_access 已关闭。",
             )
             return
-        if self._qr_window is not None and self._qr_window.isVisible():
-            self._qr_window.makeKeyAndOrderFront_(None)
-            self._nsapp.activateIgnoringOtherApps_(True)
+        self._show_qr_window(url, "局域网", "手机需与 Mac 连同一 Wi-Fi")
+
+    def _start_tunnel_bg(self) -> None:
+        """开通公网隧道（cloudflared，阻塞 ~5-15s → 后台线程），成功后自动弹二维码。"""
+        def work():
+            ok = self.tunnel.start()
+            if ok:
+                AppHelper.callAfter(self._show_tunnel_qr)
+            else:
+                err = self.tunnel.status().get("error") or "未知错误"
+                AppHelper.callAfter(self._alert, "公网访问", f"隧道启动失败：{err}")
+
+        threading.Thread(target=work, name="agentbar-tunnel", daemon=True).start()
+
+    def _show_tunnel_qr(self) -> None:
+        url = self.tunnel.url
+        if not url:
+            self._alert("公网访问", "隧道未开通（先点「开通公网访问」）。")
             return
+        self._show_qr_window(
+            f"{url}/m?token={self.settings.token}",
+            "公网（Cloudflare Tunnel）",
+            "任何网络可达 · 链接含令牌切勿外传 · 每次开通域名会变",
+        )
+
+    def _show_qr_window(self, url: str, mode: str, note: str) -> None:
         try:
-            page = _qr_page_html(url)
+            page = _qr_page_html(url, mode, note)
             from AppKit import (
                 NSBackingStoreBuffered,
                 NSMakeRect,
@@ -276,19 +312,20 @@ class AgentBarApp:
             )
             from WebKit import WKWebView
 
-            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 360, 470),
-                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
-                NSBackingStoreBuffered, False,
-            )
-            win.setTitle_("手机访问 AgentBar")
-            win.setReleasedWhenClosed_(False)
-            win.center()
-            wv = WKWebView.alloc().initWithFrame_(NSMakeRect(0, 0, 360, 470))
-            wv.loadHTMLString_baseURL_(page, None)
-            win.contentView().addSubview_(wv)
-            self._qr_window = win
-            win.makeKeyAndOrderFront_(None)
+            if self._qr_window is None:
+                win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                    NSMakeRect(0, 0, 360, 470),
+                    NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+                    NSBackingStoreBuffered, False,
+                )
+                win.setReleasedWhenClosed_(False)
+                win.center()
+                wv = WKWebView.alloc().initWithFrame_(NSMakeRect(0, 0, 360, 470))
+                win.contentView().addSubview_(wv)
+                self._qr_window, self._qr_webview = win, wv
+            self._qr_window.setTitle_(f"手机访问 AgentBar · {mode}")
+            self._qr_webview.loadHTMLString_baseURL_(page, None)
+            self._qr_window.makeKeyAndOrderFront_(None)
             self._nsapp.activateIgnoringOtherApps_(True)
         except Exception:
             log.exception("qr window failed")
@@ -320,6 +357,7 @@ class AgentBarApp:
     def _quit(self) -> None:
         log.info("quit from menu")
         try:
+            self.tunnel.stop()  # 杀掉 cloudflared，避免孤儿进程占着公网域名
             self.core.shutdown()
             self.server.stop()
             self.core.store.clear_runtime()

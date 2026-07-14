@@ -80,6 +80,20 @@ def test_lan_host_rejected_when_disabled(core, settings):
         srv.stop()
 
 
+def test_tunnel_host_dynamic_allow(api):
+    """公网隧道域名动态注册后放行，注销后恢复 403。"""
+    srv, s = api
+    host = "abc-def.trycloudflare.com"
+    code, _ = _call(srv, "/api/ping", host=host)
+    assert code == 403
+    srv.allow_host(host)
+    code, j = _call(srv, "/api/ping", host=host)
+    assert code == 200 and j["app"] == "agentbar"
+    srv.disallow_host(host)
+    code, _ = _call(srv, "/api/ping", host=host)
+    assert code == 403
+
+
 def test_index_served(api):
     srv, _ = api
     with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/", timeout=5) as r:

@@ -65,7 +65,7 @@ def test_quota_submenu_contents():
                   "fetched_at": None, "plan": None, "detail": "未知（尚无额度数据）",
                   "error": "未读到 ~/.codex/auth.json（先运行 codex login）"},
     }))
-    subs = [n for n in spec if n["kind"] == "submenu"]
+    subs = [n for n in spec if n["kind"] == "submenu" and "手机访问" not in n["title"]]
     assert len(subs) == 2
     claude = subs[0]
     assert "100%" in claude["title"] or "5h 100%" in claude["title"]
@@ -93,6 +93,35 @@ def test_core_actions_present():
     actions = {n["action"] for n in spec if n["kind"] == "action"}
     assert {"open_panel", "quick_add", "quit"} <= actions
     assert "open_web_panel" not in actions
+
+
+def _mobile_children(spec):
+    sub = next(n for n in spec if n["kind"] == "submenu" and "手机访问" in n["title"])
+    return sub, [c["action"] for c in sub["children"] if c["kind"] == "action"]
+
+
+def test_mobile_submenu_tunnel_off():
+    spec = build_menu_spec(_snap(tunnel={"state": "off", "installed": True}))
+    sub, actions = _mobile_children(spec)
+    assert "mobile_qr" in actions and "tunnel_start" in actions
+    assert "tunnel_stop" not in actions
+
+
+def test_mobile_submenu_tunnel_up():
+    spec = build_menu_spec(_snap(tunnel={
+        "state": "up", "url": "https://x.trycloudflare.com", "installed": True}))
+    sub, actions = _mobile_children(spec)
+    assert "tunnel_qr" in actions and "tunnel_stop" in actions
+    assert "tunnel_start" not in actions
+    assert "公网已开通" in sub["title"]
+
+
+def test_mobile_submenu_cloudflared_missing():
+    spec = build_menu_spec(_snap(tunnel={"state": "off", "installed": False}))
+    sub, actions = _mobile_children(spec)
+    assert "tunnel_start" not in actions
+    titles = " ".join(c["title"] for c in sub["children"])
+    assert "brew install cloudflared" in titles
 
 
 def test_title_shows_usage_percent_when_fresh():
