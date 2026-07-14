@@ -1,16 +1,7 @@
-"""Native macOS task panel window (AppKit) — the primary control surface.
-
-背景：菜单栏 accessory 进程在 macOS 26 上无权把浏览器拉到前台（cooperative
-activation），"打开 web 面板"在用户视角就是没反应。激活自己的窗口则是被允许的，
-所以任务的添加/排优先级/取消/重试全部改在本窗口完成——进程内直连 Scheduler，
-不经浏览器、不经 HTTP。web 面板保留为次要入口（日志查看/未来手机远程）。
-
-全部代码只在主线程运行（由菜单 action / NSTimer 驱动）。
-"""
+"""Native macOS task panel window (AppKit) — the primary control surface."""
 
 from __future__ import annotations
 
-import datetime
 import logging
 import time
 
@@ -21,6 +12,7 @@ from AppKit import (
     NSBackingStoreBuffered,
     NSButton,
     NSComboBox,
+    NSDatePicker,
     NSFont,
     NSMakeRect,
     NSOpenPanel,
@@ -46,7 +38,7 @@ from Foundation import NSObject, NSTimer
 
 log = logging.getLogger("agentbar.panel")
 
-W, H = 860, 620
+W, H = 880, 640
 PAD = 16
 STATE_LABEL = {
     "queued": "排队中", "running": "运行中", "waiting_quota": "等额度",
@@ -55,30 +47,10 @@ STATE_LABEL = {
 PROFILE_ITEMS = [("🔒 只读", "readonly"), ("✏️ 可编辑（默认）", "edits"),
                  ("⚠️ 完全权限", "full")]
 
-
-def _parse_scheduled_at(text: str) -> float | None:
-    """Parse schedule time string: "14:30" → today/tomorrow; "2026-07-15 14:00" → absolute."""
-    text = text.strip()
-    if not text:
-        return None
-    now = datetime.datetime.now()
-    for fmt in ("%H:%M", "%H:%M:%S"):
-        try:
-            t = datetime.datetime.strptime(text, fmt).time()
-            dt = datetime.datetime.combine(now.date(), t)
-            if dt <= now:
-                dt += datetime.timedelta(days=1)
-            return dt.timestamp()
-        except ValueError:
-            pass
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"):
-        try:
-            return datetime.datetime.strptime(text, fmt).timestamp()
-        except ValueError:
-            pass
-    raise ValueError(
-        f"无法解析定时时间 {text!r}，请用 HH:MM 或 YYYY-MM-DD HH:MM 格式"
-    )
+# NSDatePicker element flags
+_DP_YEAR_MONTH_DAY = 0x00e0   # NSDatePickerElementFlagYearMonthDay
+_DP_HOUR_MINUTE    = 0x000c   # NSDatePickerElementFlagHourMinute
+_DP_DATETIME       = _DP_YEAR_MONTH_DAY | _DP_HOUR_MINUTE
 
 
 def _label(text, x, y, w, h=18, bold=False, dim=False):
@@ -89,7 +61,7 @@ def _label(text, x, y, w, h=18, bold=False, dim=False):
     else:
         lb.setFont_(NSFont.systemFontOfSize_(11 if dim else 12))
     if dim:
-        lb.setTextColor_(lb.textColor().colorWithAlphaComponent_(0.6))
+        lb.setTextColor_(lb.textColor().colorWithAlphaComponent_(0.55))
     lb.setAutoresizingMask_(NSViewMinYMargin)
     return lb
 
@@ -97,7 +69,7 @@ def _label(text, x, y, w, h=18, bold=False, dim=False):
 def _button(title, x, y, w, target, sel, h=26):
     b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
     b.setTitle_(title)
-    b.setBezelStyle_(1)  # rounded
+    b.setBezelStyle_(1)
     b.setTarget_(target)
     b.setAction_(sel)
     return b
@@ -109,7 +81,6 @@ def _pin_top(view):
 
 
 class PanelWindowController(NSObject):
-    # ---------- init ----------
 
     def initWithCore_settings_server_(self, core, settings, server):
         self = objc.super(PanelWindowController, self).init()
@@ -121,30 +92,26 @@ class PanelWindowController(NSObject):
         self.window = None
         self._rows = []
         self._tools = []
-        self._current_efforts = []       # per-tool effort choices (from adapter)
-        self._transcript_windows = {}   # task_id → NSWindow
-        self._transcript_meta = {}      # task_id → {tool, cwd, sid, tv}
+        self._current_efforts = []
+        self._transcript_windows = {}
+        self._transcript_meta = {}
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             2.0, self, "onTick:", None, True
         )
         return self
-
-    # ---------- public ----------
 
     def show_(self, focus_prompt):
         if self.window is None:
             self._build()
         self.refresh()
         try:
-            NSApp.activateIgnoringOtherApps_(True)  # 激活自身：accessory 进程被允许
+            NSApp.activateIgnoringOtherApps_(True)
         except Exception:
             pass
         self.window.makeKeyAndOrderFront_(None)
         if focus_prompt:
             self.window.makeFirstResponder_(self.prompt_view)
         log.info("panel window shown (visible=%s)", bool(self.window.isVisible()))
-
-    # ---------- UI construction ----------
 
     def _build(self):
         mask = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
@@ -154,14 +121,14 @@ class PanelWindowController(NSObject):
         )
         self.window.setTitle_("AgentBar 任务面板")
         self.window.setReleasedWhenClosed_(False)
-        self.window.setContentMinSize_((680, 480))
+        self.window.setContentMinSize_((700, 500))
         self.window.center()
         v = self.window.contentView()
 
         y = H - PAD - 18
         v.addSubview_(_label("新任务 Prompt", PAD, y, 300, bold=True))
 
-        # prompt 多行输入
+        # Prompt textarea
         y -= 78 + 6
         self.prompt_scroll = NSScrollView.alloc().initWithFrame_(
             NSMakeRect(PAD, y, W - 2 * PAD, 78))
@@ -176,7 +143,7 @@ class PanelWindowController(NSObject):
         self.prompt_scroll.setDocumentView_(self.prompt_view)
         v.addSubview_(self.prompt_scroll)
 
-        # 参数行：工具 / 模型 / 强度 / 权限 / 添加
+        # Row 1: Tool / Model / Effort / Profile / Add
         y -= 30 + 8
         x = PAD
         self.tool_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
@@ -190,18 +157,18 @@ class PanelWindowController(NSObject):
         v.addSubview_(_pin_top(self.tool_popup))
         x += 138
 
-        self.model_combo = NSComboBox.alloc().initWithFrame_(NSMakeRect(x, y, 160, 26))
+        self.model_combo = NSComboBox.alloc().initWithFrame_(NSMakeRect(x, y, 162, 26))
         self.model_combo.setPlaceholderString_("模型（留空=默认）")
         v.addSubview_(_pin_top(self.model_combo))
-        x += 168
+        x += 170
 
         self.effort_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(x, y, 120, 26), False)
+            NSMakeRect(x, y, 116, 26), False)
         v.addSubview_(_pin_top(self.effort_popup))
-        x += 128
+        x += 124
 
         self.profile_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(x, y, 168, 26), False)
+            NSMakeRect(x, y, 162, 26), False)
         for title, value in PROFILE_ITEMS:
             if value == "full" and not self.settings.allow_full_profile:
                 continue
@@ -211,10 +178,10 @@ class PanelWindowController(NSObject):
 
         self.add_btn = _button("＋ 添加任务", W - PAD - 108, y, 108, self, "onAdd:")
         self.add_btn.setKeyEquivalent_("\r")
-        self.add_btn.setAutoresizingMask_(NSViewMinYMargin | 1)  # MinXMargin
+        self.add_btn.setAutoresizingMask_(NSViewMinYMargin | 1)
         v.addSubview_(self.add_btn)
 
-        # 目录行
+        # Row 2: CWD
         y -= 28 + 6
         v.addSubview_(_label("目录", PAD, y + 4, 34))
         self.cwd_field = NSTextField.alloc().initWithFrame_(
@@ -226,23 +193,36 @@ class PanelWindowController(NSObject):
         choose.setAutoresizingMask_(NSViewMinYMargin | 1)
         v.addSubview_(choose)
 
-        # 定时行
+        # Row 3: Scheduled time (checkbox + NSDatePicker)
         y -= 26 + 4
-        v.addSubview_(_label("定时", PAD, y + 4, 34, dim=True))
-        self.schedule_field = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(PAD + 40, y, 220, 22))
-        self.schedule_field.setPlaceholderString_("留空=立即  或  HH:MM / YYYY-MM-DD HH:MM")
-        self.schedule_field.setFont_(NSFont.systemFontOfSize_(11))
-        self.schedule_field.setAutoresizingMask_(NSViewMinYMargin)
-        v.addSubview_(self.schedule_field)
+        # Checkbox (NSSwitchButton = 3)
+        self.schedule_check = NSButton.alloc().initWithFrame_(NSMakeRect(PAD, y, 90, 22))
+        self.schedule_check.setTitle_("⏰ 定时运行")
+        self.schedule_check.setButtonType_(3)
+        self.schedule_check.setState_(0)
+        self.schedule_check.setFont_(NSFont.systemFontOfSize_(12))
+        self.schedule_check.setTarget_(self)
+        self.schedule_check.setAction_("onScheduleToggled:")
+        v.addSubview_(self.schedule_check)
+        # Date picker (hidden initially)
+        self.schedule_picker = NSDatePicker.alloc().initWithFrame_(
+            NSMakeRect(PAD + 96, y - 1, 230, 26))
+        self.schedule_picker.setDatePickerStyle_(0)          # NSTextFieldDatePickerStyle
+        self.schedule_picker.setDatePickerElements_(_DP_DATETIME)
+        self.schedule_picker.setHidden_(True)
+        v.addSubview_(self.schedule_picker)
+        hint = _label("选中后可设定执行时间（日期 + 时分）", PAD + 96, y - 1, 300, dim=True)
+        hint.setFont_(NSFont.systemFontOfSize_(11))
+        self._schedule_hint = hint
+        v.addSubview_(hint)
 
-        # 任务表
-        table_top = y - 8
+        # Task table
+        table_top = y - 6
         bottom_h = 52
         self.table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 2 * PAD, 100))
         for ident, title, width in (
-            ("prio", "#", 36), ("state", "状态", 64), ("title", "任务", 280),
-            ("tool", "工具", 64), ("model", "模型", 90), ("sched", "定时", 60),
+            ("prio", "#", 36), ("state", "状态", 64), ("title", "任务", 290),
+            ("tool", "工具", 64), ("model", "模型", 90), ("sched", "定时", 54),
             ("reason", "说明", 160),
         ):
             col = NSTableColumn.alloc().initWithIdentifier_(ident)
@@ -263,7 +243,7 @@ class PanelWindowController(NSObject):
         scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         v.addSubview_(scroll)
 
-        # 底部操作条
+        # Bottom action bar
         bx = PAD
         for title, sel, w in (
             ("⇧ 置顶", "onMoveTop:", 76), ("↑ 上移", "onMoveUp:", 70),
@@ -289,15 +269,14 @@ class PanelWindowController(NSObject):
 
         self.onToolChanged_(None)
 
-    # ---------- data refresh ----------
+    # ---------- refresh ----------
 
     def onTick_(self, _timer):
         if self.window is not None and self.window.isVisible():
             self.refresh()
-        # Also refresh any open transcript windows for running tasks
         for tid, tw in list(self._transcript_windows.items()):
             if tw.isVisible():
-                self._refresh_transcript_window(tid, tw)
+                self._refresh_transcript_window(tid)
 
     def refresh(self):
         try:
@@ -334,15 +313,11 @@ class PanelWindowController(NSObject):
 
     def _selected_id(self):
         i = self.table.selectedRow() if self.window else -1
-        if 0 <= i < len(self._rows):
-            return self._rows[i]["id"]
-        return None
+        return self._rows[i]["id"] if 0 <= i < len(self._rows) else None
 
     def _selected_task(self):
         i = self.table.selectedRow() if self.window else -1
-        if 0 <= i < len(self._rows):
-            return self._rows[i]
-        return None
+        return self._rows[i] if 0 <= i < len(self._rows) else None
 
     # ---------- NSTableViewDataSource ----------
 
@@ -363,9 +338,7 @@ class PanelWindowController(NSObject):
         if ident == "tool":
             return t["tool"]
         if ident == "model":
-            m = t.get("model") or ""
-            e = t.get("effort") or ""
-            return f"{m} {e}".strip()
+            return f"{t.get('model') or ''} {t.get('effort') or ''}".strip()
         if ident == "sched":
             sa = t.get("scheduled_at")
             if sa and sa > time.time():
@@ -375,7 +348,7 @@ class PanelWindowController(NSObject):
             return t.get("state_reason", "")
         return ""
 
-    # ---------- actions ----------
+    # ---------- toolbar actions ----------
 
     def _current_tool(self):
         i = self.tool_popup.indexOfSelectedItem()
@@ -384,16 +357,22 @@ class PanelWindowController(NSObject):
     def onToolChanged_(self, _sender):
         i = self.tool_popup.indexOfSelectedItem()
         info = self._tools[i] if 0 <= i < len(self._tools) else {}
-        # Update model combo
+        # Reset model combo (clear typed value + update dropdown list)
+        self.model_combo.setStringValue_("")
         self.model_combo.removeAllItems()
         self.model_combo.addItemsWithObjectValues_(info.get("models") or [])
-        # Update effort popup per-adapter
-        efforts = info.get("efforts") or []
-        self._current_efforts = list(efforts)
+        # Reset effort popup per adapter
+        efforts = list(info.get("efforts") or [])
+        self._current_efforts = efforts
         self.effort_popup.removeAllItems()
         self.effort_popup.addItemsWithTitles_(
             ["强度：默认"] + [f"强度：{e}" for e in efforts]
         )
+
+    def onScheduleToggled_(self, _sender):
+        checked = bool(self.schedule_check.state())
+        self.schedule_picker.setHidden_(not checked)
+        self._schedule_hint.setHidden_(checked)
 
     def onAdd_(self, _sender):
         prompt = str(self.prompt_view.string()).strip()
@@ -401,14 +380,16 @@ class PanelWindowController(NSObject):
         profile_title = str(self.profile_popup.titleOfSelectedItem())
         profile = next(v for t, v in PROFILE_ITEMS if t == profile_title)
         effort = self._current_efforts[effort_i - 1] if effort_i > 0 and self._current_efforts else None
+
         scheduled_at = None
-        sched_text = str(self.schedule_field.stringValue()).strip()
-        if sched_text:
-            try:
-                scheduled_at = _parse_scheduled_at(sched_text)
-            except ValueError as e:
-                self._alert("定时格式错误", str(e))
+        if self.schedule_check.state():
+            ns_date = self.schedule_picker.dateValue()
+            ts = float(ns_date.timeIntervalSince1970())
+            if ts <= time.time():
+                self._alert("定时时间无效", "所选时间已过，请选择一个未来的时间。")
                 return
+            scheduled_at = ts
+
         try:
             self.core.add_task(
                 prompt=prompt,
@@ -423,7 +404,9 @@ class PanelWindowController(NSObject):
             self._alert("无法添加任务", str(e))
             return
         self.prompt_view.setString_("")
-        self.schedule_field.setStringValue_("")
+        self.schedule_check.setState_(0)
+        self.schedule_picker.setHidden_(True)
+        self._schedule_hint.setHidden_(False)
         self.refresh()
 
     def onChooseDir_(self, _sender):
@@ -437,39 +420,32 @@ class PanelWindowController(NSObject):
                 self.cwd_field.setStringValue_(str(urls.objectAtIndex_(0).path()))
 
     def onTableDoubleClick_(self, _sender):
-        """Double-click on a task: load its fields into the input form for easy review/copy."""
+        """Double-click: load the task's fields into the input form for easy review/copy."""
         t = self._selected_task()
         if not t:
             return
-        # Fill prompt
-        self.prompt_view.setString_(t.get("prompt") or t.get("title") or "")
-        # Fill CWD
+        self.prompt_view.setString_(t.get("prompt") or "")
         self.cwd_field.setStringValue_(t.get("cwd") or "")
-        # Match tool
         tool = t.get("tool", "")
         for idx, info in enumerate(self._tools):
             if info["name"] == tool:
                 self.tool_popup.selectItemAtIndex_(idx)
                 self.onToolChanged_(None)
                 break
-        # Fill model
         self.model_combo.setStringValue_(t.get("model") or "")
-        # Match effort
         effort = t.get("effort") or ""
         if effort and effort in self._current_efforts:
             self.effort_popup.selectItemAtIndex_(self._current_efforts.index(effort) + 1)
         else:
             self.effort_popup.selectItemAtIndex_(0)
-        # Match profile
         profile = t.get("profile", "edits")
-        for idx, (title, value) in enumerate(PROFILE_ITEMS):
+        for title, value in PROFILE_ITEMS:
             if value == profile:
                 try:
                     self.profile_popup.selectItemWithTitle_(title)
                 except Exception:
                     pass
                 break
-        # Scroll to top of prompt
         self.window.makeFirstResponder_(self.prompt_view)
 
     def onShowTranscript_(self, _sender):
@@ -478,7 +454,7 @@ class PanelWindowController(NSObject):
             self._alert("未选中任务", "请先在任务列表中选择一行。")
             return
         if not t.get("session_id"):
-            self._alert("无会话记录", "该任务尚未产生会话 ID（可能还未开始运行或工具不支持）。")
+            self._alert("无会话记录", "该任务尚无会话 ID（可能还未开始运行或工具不支持）。")
             return
         self._open_transcript_window(t)
 
@@ -491,60 +467,64 @@ class PanelWindowController(NSObject):
         title = task_dict.get("title", "")
 
         if tid in self._transcript_windows:
-            w = self._transcript_windows[tid]
-            if w.isVisible():
-                w.makeKeyAndOrderFront_(None)
-                self._refresh_transcript_window(tid, w)
+            tw = self._transcript_windows[tid]
+            if tw.isVisible():
+                tw.makeKeyAndOrderFront_(None)
+                self._refresh_transcript_window(tid)
                 return
 
         mask = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                 | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
         tw = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, 740, 560), mask, NSBackingStoreBuffered, False
+            NSMakeRect(0, 0, 780, 580), mask, NSBackingStoreBuffered, False
         )
         tw.setTitle_(f"对话：{title[:50]}")
         tw.setReleasedWhenClosed_(False)
         tw.center()
         cv = tw.contentView()
 
-        # Copy resume command button at top
-        copy_btn = _button("复制续聊命令", 740 - PAD - 130, 560 - PAD - 26, 130, self,
-                           "onCopyResumeCmd:")
-        copy_btn.setAutoresizingMask_(NSViewMinYMargin | 1)
+        # "复制续聊命令" button at top-right
+        copy_btn = _button("复制续聊命令", 780 - PAD - 132, 580 - PAD - 26, 132,
+                           self, "onCopyResumeCmd:")
         copy_btn.setRepresentedObject_(tid)
+        copy_btn.setAutoresizingMask_(NSViewMinYMargin | 1)
         cv.addSubview_(copy_btn)
 
-        # NSTextView for transcript content
-        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 720, 500))
-        tv.setEditable_(False)
-        tv.setSelectable_(True)
-        tv.setFont_(NSFont.userFixedPitchFontOfSize_(12))
-        tv.setRichText_(False)
-        tv.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        # WKWebView for rich HTML rendering
+        wkview = self._make_webview(NSMakeRect(PAD, PAD, 780 - 2 * PAD, 580 - 2 * PAD - 36))
+        cv.addSubview_(wkview)
 
-        scroll = NSScrollView.alloc().initWithFrame_(
-            NSMakeRect(PAD, PAD, 740 - 2 * PAD, 560 - 2 * PAD - 36))
-        scroll.setDocumentView_(tv)
-        scroll.setHasVerticalScroller_(True)
-        scroll.setBorderType_(1)
-        scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        cv.addSubview_(scroll)
-
-        # Store extra context on the window via _transcript_meta dict
-        self._transcript_meta[tid] = {"tool": tool, "cwd": cwd, "sid": sid, "tv": tv}
+        self._transcript_meta[tid] = {"tool": tool, "cwd": cwd, "sid": sid, "wkview": wkview}
         self._transcript_windows[tid] = tw
-        self._refresh_transcript_window(tid, tw)
+        self._refresh_transcript_window(tid)
         tw.makeKeyAndOrderFront_(None)
 
     @objc.python_method
-    def _refresh_transcript_window(self, tid: str, _tw):
+    def _make_webview(self, frame):
+        """Create a WKWebView; fallback to NSTextView if WebKit is unavailable."""
+        try:
+            from WebKit import WKWebView, WKWebViewConfiguration
+            cfg = WKWebViewConfiguration.alloc().init()
+            wk = WKWebView.alloc().initWithFrame_configuration_(frame, cfg)
+            wk.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            return wk
+        except Exception:
+            log.warning("WKWebView unavailable, falling back to NSTextView")
+            tv = NSTextView.alloc().initWithFrame_(frame)
+            tv.setEditable_(False)
+            tv.setSelectable_(True)
+            tv.setFont_(NSFont.userFixedPitchFontOfSize_(12))
+            tv.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            return tv
+
+    @objc.python_method
+    def _refresh_transcript_window(self, tid: str):
         meta = self._transcript_meta.get(tid)
         if not meta:
             return
         tool = meta.get("tool", "")
         cwd = meta.get("cwd", "")
         sid = meta.get("sid", "")
-        # Always get latest session_id from live task (may have been set after window opened)
         try:
             with self.core._lock:
                 live = self.core._tasks.get(tid)
@@ -555,20 +535,36 @@ class PanelWindowController(NSObject):
             pass
         if not sid:
             return
-        from .transcript import find_session_file, parse_transcript
+
+        from .transcript import find_session_file, to_html, parse_transcript
         path = find_session_file(tool, cwd, sid)
-        if not path:
-            text = f"[未找到会话文件]\nsession_id: {sid}\n工具: {tool}\n目录: {cwd}"
-        else:
+        wkview = meta.get("wkview")
+        if not wkview:
+            return
+
+        try:
+            from WebKit import WKWebView
+            if isinstance(wkview, WKWebView):
+                if path:
+                    content = to_html(tool, path)
+                else:
+                    content = f"<p style='color:#888;padding:16px'>未找到会话文件<br>session_id: {sid}<br>工具: {tool}<br>目录: {cwd}</p>"
+                    content = f"<!DOCTYPE html><html><body style='font-family:-apple-system'>{content}</body></html>"
+                from Foundation import NSURL
+                wkview.loadHTMLString_baseURL_(content, None)
+                return
+        except Exception:
+            pass
+        # Fallback: NSTextView plain text
+        if path:
             text = parse_transcript(tool, path)
-        tv = meta.get("tv")
-        if tv:
-            tv.setString_(text)
+        else:
+            text = f"[未找到会话文件]\nsession_id: {sid}\n工具: {tool}"
+        wkview.setString_(text)
 
     def onCopyResumeCmd_(self, _sender):
         try:
-            btn = _sender
-            tid = str(btn.representedObject() or "")
+            tid = str(_sender.representedObject() or "")
             with self.core._lock:
                 live = self.core._tasks.get(tid)
             if not live or not live.session_id:

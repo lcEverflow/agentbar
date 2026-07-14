@@ -30,7 +30,8 @@ def _leaves(nodes):
             yield n
 
 
-def test_every_row_is_actionable():
+def test_enabled_rows_are_actionable():
+    """Enabled (clickable) rows must have an action; disabled info rows may have action=None."""
     spec = build_menu_spec(_snap(
         running_titles=["任务A"],
         quota={"claude": {"state": "ok", "windows": [
@@ -39,8 +40,8 @@ def test_every_row_is_actionable():
             "plan": "max"}},
     ))
     for leaf in _leaves(spec):
-        assert leaf["action"], f"死行: {leaf['title']}"
-        assert leaf["enabled"] is True
+        if leaf.get("enabled"):
+            assert leaf["action"], f"启用的行没有 action: {leaf['title']}"
 
 
 def test_pause_resume_toggle():

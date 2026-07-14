@@ -126,6 +126,20 @@ class Adapter(ABC):
     def model_suggestions(self) -> list[str]:
         return []
 
+    def build_env(self, base_env: dict) -> dict:
+        """Return subprocess env with the tool binary's dir prepended to PATH.
+
+        Fixes launchd-spawned processes where nvm/node are missing from PATH:
+        the configured codex/claude binary dir contains 'node' too.
+        """
+        binary = self.binary()
+        if binary:
+            bin_dir = os.path.dirname(binary)
+            path = base_env.get("PATH", "")
+            if bin_dir and bin_dir not in path.split(":"):
+                return {**base_env, "PATH": f"{bin_dir}:{path}"}
+        return base_env
+
     def availability(self) -> dict:
         b = self.binary()
         return {

@@ -32,6 +32,11 @@ def _action(title: str, action: str = "open_panel", enabled: bool = True) -> dic
             "enabled": enabled, "children": None}
 
 
+def _info(title: str) -> dict:
+    """A non-clickable informational row (status display)."""
+    return {"kind": "action", "title": title, "action": None, "enabled": False, "children": None}
+
+
 def _sep() -> dict:
     return {"kind": "sep", "title": "", "action": None, "enabled": True, "children": None}
 
@@ -101,14 +106,14 @@ def build_menu_spec(snapshot: dict) -> list[dict]:
     queued = snapshot.get("queued", 0)
     waiting = snapshot.get("waiting_quota", 0)
 
-    rows.append(_action(f"{_STATE_GLYPH.get(status, '◇')} AgentBar · {label}"))
-    rows.append(_action(f"队列 {queued} 排队 · {waiting} 等额度"))
+    rows.append(_info(f"{_STATE_GLYPH.get(status, '◇')} AgentBar · {label}"))
+    rows.append(_info(f"队列 {queued} 排队 · {waiting} 等额度"))
     rows.append(_sep())
 
     running = snapshot.get("running_titles") or []
     if running:
         for title in running[:3]:
-            rows.append(_action(f"▶ {title[:46]}"))
+            rows.append(_action(f"▶ {title[:46]}", action="open_panel"))
     else:
         active = [
             t for t in snapshot.get("tasks") or []
@@ -117,9 +122,9 @@ def build_menu_spec(snapshot: dict) -> list[dict]:
         if active:
             for t in active[:3]:
                 mark = _TASK_MARK.get(t["state"], "·")
-                rows.append(_action(f"{mark} {t.get('title', '')[:46]}"))
+                rows.append(_action(f"{mark} {t.get('title', '')[:46]}", action="open_panel"))
         else:
-            rows.append(_action("暂无进行中的任务"))
+            rows.append(_info("暂无进行中的任务"))
     rows.append(_sep())
 
     quota = snapshot.get("quota") or {}

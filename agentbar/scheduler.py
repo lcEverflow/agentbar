@@ -526,6 +526,7 @@ class Scheduler:
         env = os.environ.copy()
         for k in _ENV_STRIP:
             env.pop(k, None)
+        env = adapter.build_env(env)  # ensure tool binary dir is on PATH
 
         rc: int | None = None
         try:
