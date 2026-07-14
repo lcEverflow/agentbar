@@ -27,7 +27,7 @@ setup(
         "py2app": {
             # 不打 zip：agentbar 需要 importlib.resources 读 web/*.html，
             # qrcode 需要读包内数据文件，散装进 Resources/lib 最稳。
-            "packages": ["agentbar", "qrcode"],
+            "packages": ["agentbar", "qrcode", "mistune"],
             "plist": {
                 "CFBundleName": "AgentBar",
                 "CFBundleDisplayName": "AgentBar",

@@ -4,6 +4,7 @@ version = "0.8.0"
 description = "macOS menu bar scheduler for AI CLI agents (Claude Code, Codex, ...)"
 requires-python = ">=3.11"
 dependencies = [
+    "mistune>=3.3.3",
     # 原生 AppKit 菜单栏（NSStatusItem/NSMenu）。rumps 已移除：其定时重建
     # 打开中菜单 + 主线程阻塞模式在 macOS 26 上造成菜单卡死/点击失效。
     "pyobjc-framework-Cocoa>=11.0; sys_platform == 'darwin'",

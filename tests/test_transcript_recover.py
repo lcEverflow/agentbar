@@ -53,3 +53,21 @@ def test_claude_recover_by_mtime(fake_home):
 
 def test_recover_requires_started_at(fake_home):
     assert transcript.recover_session_id("codex", "/tmp", None) is None
+
+
+def test_markdown_rich_rendering():
+    """标题/列表/表格/引用/链接必须渲染成对应 HTML 结构，不能塌成一段。"""
+    from agentbar.transcript import _text_to_html
+    md = ("## 标题\n\n- 项目1\n- 项目2\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n"
+          "> 引用\n\n公式 $x^2$ [链接](https://example.com)")
+    h = _text_to_html(md)
+    assert "<h2>" in h and "<ul>" in h and "<li>" in h
+    assert "<table>" in h and "<blockquote>" in h
+    assert '<a href="https://example.com"' in h
+    assert "\\(x^2\\)" in h  # math 插件转成 MathJax 定界符
+
+
+def test_markdown_escapes_raw_html():
+    from agentbar.transcript import _text_to_html
+    h = _text_to_html("<script>alert(1)</script> 正常文字")
+    assert "<script>" not in h

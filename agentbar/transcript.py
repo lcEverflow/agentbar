@@ -38,7 +38,20 @@ pre{{background:#1e1e2e;color:#cdd6f4;padding:10px 14px;border-radius:6px;
 code{{background:#e8e8e8;padding:1px 5px;border-radius:3px;
       font-size:11.5px;font-family:'SF Mono',Monaco,monospace}}
 pre code{{background:none;padding:0}}
-p{{margin:4px 0}}
+p{{margin:6px 0}}
+h1,h2,h3,h4{{margin:14px 0 6px;line-height:1.3}}
+h1{{font-size:17px}} h2{{font-size:15px;border-bottom:1px solid #e5e5e5;padding-bottom:3px}}
+h3{{font-size:13.5px}} h4{{font-size:12.5px}}
+ul,ol{{margin:6px 0;padding-left:22px}}
+li{{margin:3px 0}}
+table{{border-collapse:collapse;margin:8px 0;font-size:12px;display:block;
+       overflow-x:auto;max-width:100%}}
+th,td{{border:1px solid #d9d9d9;padding:5px 9px;text-align:left;vertical-align:top}}
+th{{background:#f0f0f0;font-weight:600}}
+blockquote{{margin:8px 0;padding:4px 12px;border-left:3px solid #c5c5c5;
+            color:#666;background:#fafafa}}
+a{{color:#2980b9;text-decoration:none}} a:hover{{text-decoration:underline}}
+hr{{border:none;border-top:1px solid #ddd;margin:12px 0}}
 </style></head><body>{body}</body></html>"""
 
 # ---------- file discovery ----------
@@ -323,8 +336,31 @@ def _codex_content_to_html(content) -> str:
 
 # ---------- text → HTML with math passthrough ----------
 
+_MD = None
+
+
+def _markdown():
+    """惰性构建 mistune 渲染器（表格/删除线/数学公式/自动链接）。"""
+    global _MD
+    if _MD is None:
+        import mistune
+        # escape=True：把消息里的原始 HTML 转义掉，只认 markdown 语法
+        _MD = mistune.create_markdown(
+            escape=True, plugins=["table", "strikethrough", "math", "url"]
+        )
+    return _MD
+
+
 def _text_to_html(text: str) -> str:
-    """Convert plain text with markdown and LaTeX math to HTML."""
+    """Markdown → HTML（mistune；math 插件输出 \\(..\\)/\\[..\\] 交给 MathJax）。"""
+    try:
+        return _markdown()(text)
+    except Exception:
+        return _text_to_html_legacy(text)
+
+
+def _text_to_html_legacy(text: str) -> str:
+    """手写降级渲染（mistune 不可用时）：代码块/行内样式/数学穿透。"""
     lines = text.splitlines()
     out: list[str] = []
     in_code = False
