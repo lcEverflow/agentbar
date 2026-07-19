@@ -118,13 +118,14 @@ def test_main_menu_has_ctrl_and_cmd_shortcuts():
 
 
 def test_ring_icon_renders_offscreen():
-    """双环图标离屏渲染冒烟：18pt 模板图，None/数值进度都不能抛异常。"""
+    """双环图标离屏渲染冒烟：18pt 模板图，各进度/状态组合都不能抛异常。"""
     from agentbar.menubar import _ring_icon
 
     for outer, inner in ((0.37, 0.8), (None, None), (1.0, 0.0), (1.5, None)):
-        img = _ring_icon(outer, inner)
-        assert img.isTemplate()
-        assert img.size().width == 18.0 and img.size().height == 18.0
+        for status in ("idle", "running", "waiting", "paused"):
+            img = _ring_icon(outer, inner, status)
+            assert img.isTemplate()
+            assert img.size().width == 18.0 and img.size().height == 18.0
 
 
 def test_cli_open_uses_macos_open_command(monkeypatch):

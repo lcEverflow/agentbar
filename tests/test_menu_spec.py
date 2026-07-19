@@ -134,7 +134,17 @@ def test_title_shows_usage_percent_when_fresh():
                    "source": "usage_api", "fetched_at": now, "plan": None,
                    "detail": "", "error": None}})
     t = build_title(snap)
-    assert "37%" in t and "◆2" in t
+    assert "37%" in t and "2" in t
+
+
+def test_title_has_no_glyphs_single_icon():
+    """状态字符（◇/◆/◐/Ⅱ）全部移入环形图标，标题只留文字——否则像两个图标。"""
+    for status, running in (("idle", []), ("running", ["a"]),
+                            ("waiting", []), ("paused", [])):
+        t = build_title(_snap(status=status, running_titles=running))
+        assert not set(t) & set("◇◆◐Ⅱ▶"), f"{status} 标题混入图形字符: {t!r}"
+    assert build_title(_snap()) == ""              # 空闲无数据 → 纯图标
+    assert build_title(_snap(running_titles=["a"])) == ""  # 单任务运行 → 图标中心点表达
 
 
 def test_title_hides_stale_usage():

@@ -33,6 +33,7 @@ from AppKit import (
     NSImage,
     NSImageLeading,
     NSLineCapStyleRound,
+    NSMakeRect,
     NSMenu,
     NSMenuItem,
     NSStatusBar,
@@ -59,11 +60,13 @@ _RINGS = (
 )
 
 
-def _ring_icon(outer: float | None, inner: float | None) -> NSImage:
+def _ring_icon(outer: float | None, inner: float | None, status: str = "idle") -> NSImage:
     """画双环额度图标：模板图（黑+透明度），菜单栏深浅色自动适配。
 
     每环先画整圈淡色轨道，再从 12 点方向顺时针画已用比例的实线弧；
     progress=None 表示无可信数据，只留轨道（诚实：不编造用量）。
+    调度状态并入环心徽标（实心点=运行中、双竖条=已暂停），标题不再放
+    ◇/◆ 等字符——菜单栏只保留这一个图标。
     """
     img = NSImage.alloc().initWithSize_((RING_SIZE, RING_SIZE))
     img.lockFocus()
@@ -86,6 +89,15 @@ def _ring_icon(outer: float | None, inner: float | None) -> NSImage:
             center, radius, 90.0, 90.0 - 360.0 * min(1.0, progress), True
         )
         arc.stroke()
+    cx = cy = RING_SIZE / 2.0
+    NSColor.blackColor().setFill()
+    if status == "running":
+        NSBezierPath.bezierPathWithOvalInRect_(
+            NSMakeRect(cx - 2.0, cy - 2.0, 4.0, 4.0)
+        ).fill()
+    elif status == "paused":
+        for x in (cx - 2.1, cx + 0.9):
+            NSBezierPath.bezierPathWithRect_(NSMakeRect(x, cy - 2.2, 1.2, 4.4)).fill()
     img.unlockFocus()
     img.setTemplate_(True)
     return img
@@ -264,13 +276,15 @@ class AgentBarApp:
             return
         self._item.button().setTitle_(build_title(snap))
         outer, inner = build_ring_progress(snap)
+        status = snap.get("status", "idle")
         key = (
             None if outer is None else round(outer, 2),
             None if inner is None else round(inner, 2),
+            status,
         )
         if key != self._ring_key:
             self._ring_key = key
-            self._item.button().setImage_(_ring_icon(outer, inner))
+            self._item.button().setImage_(_ring_icon(outer, inner, status))
 
     def _rebuild_menu(self) -> None:
         if self._menu is None:

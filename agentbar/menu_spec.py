@@ -47,13 +47,15 @@ def _submenu(title: str, children: list[dict]) -> dict:
 
 
 def build_title(snapshot: dict) -> str:
-    """状态栏标题：状态符号 + 运行数 + Claude 5h 用量（有新鲜数据才显示）。"""
-    status = snapshot.get("status", "idle")
-    glyph = _STATE_GLYPH.get(status, "◇")
-    parts = [glyph]
+    """状态栏标题：只放文字（运行数>1 的数字 + Claude 用量）。
+
+    状态图形全部在双环图标里（环心实心点=运行中、双竖条=已暂停），
+    标题不再放 ◇/◆/◐/Ⅱ 字符——否则菜单栏看起来像两个图标。
+    """
+    parts = []
     n_run = len(snapshot.get("running_titles") or [])
     if n_run > 1:
-        parts[0] = f"{glyph}{n_run}"
+        parts.append(str(n_run))
     claude = (snapshot.get("quota") or {}).get("claude") or {}
     fetched = claude.get("fetched_at")
     windows = claude.get("windows") or []
