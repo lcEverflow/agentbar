@@ -69,6 +69,30 @@ def build_title(snapshot: dict) -> str:
     return " ".join(parts)
 
 
+def _ring_progress(qi: dict | None) -> float | None:
+    """单工具环形进度：新鲜 usage 主窗口 used%/100；受限 → 1.0；无数据 → None（只画轨道）。"""
+    if not qi:
+        return None
+    fetched = qi.get("fetched_at")
+    windows = qi.get("windows") or []
+    if windows and fetched and time.time() - fetched < TITLE_USAGE_STALE:
+        up = windows[0].get("used_percent")
+        if up is not None:
+            return min(1.0, max(0.0, float(up) / 100.0))
+    if qi.get("state") == "limited":
+        return 1.0
+    return None
+
+
+def build_ring_progress(snapshot: dict) -> tuple[float | None, float | None]:
+    """状态栏双环图标进度（外圈 Claude、内圈 Codex）——与 aiusagebar 同款外围圈显示。
+
+    返回 (outer, inner)，每项 0.0-1.0 或 None；None 表示无可信数据，只画底色轨道。
+    """
+    quota = snapshot.get("quota") or {}
+    return _ring_progress(quota.get("claude")), _ring_progress(quota.get("codex"))
+
+
 def _quota_compact(qi: dict) -> str:
     windows = qi.get("windows") or []
     if windows:

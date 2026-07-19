@@ -84,6 +84,49 @@ def test_pause_resume_dispatch():
     assert app.core.paused_calls == ["pause", "resume"]
 
 
+def test_main_menu_has_ctrl_and_cmd_shortcuts():
+    """⌃W/⌘W 关窗、⌃Q/⌘Q 退出：主菜单里必须各挂两份键位，quit 走 bridge 完整清理。"""
+    from AppKit import (
+        NSApplication,
+        NSEventModifierFlagCommand,
+        NSEventModifierFlagControl,
+    )
+    from agentbar.menubar import _Bridge
+
+    app = _app()
+    app._nsapp = NSApplication.sharedApplication()
+    app._bridge = _Bridge.alloc().initWithOwner_(app)
+    app._install_main_menu()
+
+    main = app._nsapp.mainMenu()
+    found = []  # (title, key, mask, representedObject)
+    for i in range(main.numberOfItems()):
+        sub = main.itemAtIndex_(i).submenu()
+        if sub is None:
+            continue
+        for j in range(sub.numberOfItems()):
+            it = sub.itemAtIndex_(j)
+            if str(it.keyEquivalent()) in ("w", "q"):
+                found.append((str(it.keyEquivalent()),
+                              int(it.keyEquivalentModifierMask()),
+                              str(it.representedObject() or "")))
+    def has(key, mask, rep=""):
+        return any(k == key and m & mask and r == rep for k, m, r in found)
+
+    assert has("w", NSEventModifierFlagCommand) and has("w", NSEventModifierFlagControl)
+    assert has("q", NSEventModifierFlagCommand, "quit") and has("q", NSEventModifierFlagControl, "quit")
+
+
+def test_ring_icon_renders_offscreen():
+    """双环图标离屏渲染冒烟：18pt 模板图，None/数值进度都不能抛异常。"""
+    from agentbar.menubar import _ring_icon
+
+    for outer, inner in ((0.37, 0.8), (None, None), (1.0, 0.0), (1.5, None)):
+        img = _ring_icon(outer, inner)
+        assert img.isTemplate()
+        assert img.size().width == 18.0 and img.size().height == 18.0
+
+
 def test_cli_open_uses_macos_open_command(monkeypatch):
     captured = {}
 

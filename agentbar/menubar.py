@@ -26,6 +26,13 @@ from AppKit import (
     NSAlert,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSBezierPath,
+    NSColor,
+    NSEventModifierFlagCommand,
+    NSEventModifierFlagControl,
+    NSImage,
+    NSImageLeading,
+    NSLineCapStyleRound,
     NSMenu,
     NSMenuItem,
     NSStatusBar,
@@ -35,13 +42,53 @@ from Foundation import NSObject, NSTimer
 from PyObjCTools import AppHelper
 
 from .config import Settings
-from .menu_spec import build_menu_spec, build_title
+from .menu_spec import build_menu_spec, build_ring_progress, build_title
 from .scheduler import Scheduler
 from .server import ApiServer
 
 log = logging.getLogger("agentbar.menubar")
 
 TITLE_REFRESH_SECONDS = 2.0
+
+# 状态栏双环图标 —— 几何参数与 aiusagebar 的 menuBarImage 对齐（18pt 模板图）。
+RING_SIZE = 18.0
+_RINGS = (
+    # (radius, line_width, track_alpha, fill_alpha)：外圈 Claude、内圈 Codex
+    (7.2, 1.75, 0.22, 1.0),
+    (4.35, 1.65, 0.18, 0.78),
+)
+
+
+def _ring_icon(outer: float | None, inner: float | None) -> NSImage:
+    """画双环额度图标：模板图（黑+透明度），菜单栏深浅色自动适配。
+
+    每环先画整圈淡色轨道，再从 12 点方向顺时针画已用比例的实线弧；
+    progress=None 表示无可信数据，只留轨道（诚实：不编造用量）。
+    """
+    img = NSImage.alloc().initWithSize_((RING_SIZE, RING_SIZE))
+    img.lockFocus()
+    center = (RING_SIZE / 2.0, RING_SIZE / 2.0)
+    for (radius, width, track_alpha, fill_alpha), progress in zip(_RINGS, (outer, inner)):
+        NSColor.blackColor().colorWithAlphaComponent_(track_alpha).setStroke()
+        track = NSBezierPath.bezierPath()
+        track.setLineWidth_(width)
+        track.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_(
+            center, radius, 0.0, 360.0
+        )
+        track.stroke()
+        if progress is None or progress <= 0:
+            continue
+        NSColor.blackColor().colorWithAlphaComponent_(fill_alpha).setStroke()
+        arc = NSBezierPath.bezierPath()
+        arc.setLineWidth_(width)
+        arc.setLineCapStyle_(NSLineCapStyleRound)
+        arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+            center, radius, 90.0, 90.0 - 360.0 * min(1.0, progress), True
+        )
+        arc.stroke()
+    img.unlockFocus()
+    img.setTemplate_(True)
+    return img
 
 
 def _qr_page_html(url: str, mode: str = "局域网", note: str = "") -> str:
@@ -99,6 +146,7 @@ class AgentBarApp:
         self._menu = None
         self._timer = None
         self._panel = None  # 原生任务面板窗口（懒加载）
+        self._ring_key = None    # 双环图标缓存键（进度没变不重画，避免 2s 一次的无谓刷新）
         self._qr_window = None   # 手机访问二维码窗口（懒加载）
         self._qr_webview = None  # 二维码窗口里的 WKWebView（内容可切换 LAN/公网）
         from .tunnel import TunnelManager
@@ -120,6 +168,7 @@ class AgentBarApp:
         self._menu.setAutoenablesItems_(False)
         self._menu.setDelegate_(self._bridge)
         self._item.setMenu_(self._menu)
+        self._item.button().setImagePosition_(NSImageLeading)
         self._update_title()
         self._rebuild_menu()
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -144,8 +193,26 @@ class AgentBarApp:
 
     def _install_main_menu(self) -> None:
         """Install a minimal main menu so Cmd+C/V/X/Z work in our NSTextView/NSTextField,
-        and Cmd+W closes the front window (nil-target first-responder chain)."""
+        Cmd/Ctrl+W closes the front window, and Cmd/Ctrl+Q quits with full cleanup.
+
+        快捷键只在本 App 处于激活态（面板/对话窗口在前台）时生效——accessory
+        进程收不到其他 App 前台时的按键，这是 macOS 的路由规则。
+        """
         main = NSMenu.alloc().init()
+
+        # App menu: Quit 走 bridge 的 "quit" 动作（停隧道/调度器/服务器再退出），
+        # 不能用 NSApp.terminate:（跳过清理会留下 cloudflared 孤儿进程）。
+        app_menu = NSMenu.alloc().initWithTitle_("AgentBar")
+        for mask in (NSEventModifierFlagCommand, NSEventModifierFlagControl):
+            quit_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Quit AgentBar", "onAction:", "q")
+            quit_it.setKeyEquivalentModifierMask_(mask)
+            quit_it.setTarget_(self._bridge)
+            quit_it.setRepresentedObject_("quit")
+            app_menu.addItem_(quit_it)
+        app_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("AgentBar", None, "")
+        app_item.setSubmenu_(app_menu)
+        main.addItem_(app_item)
 
         edit_menu = NSMenu.alloc().initWithTitle_("Edit")
         for title, sel, key in [
@@ -167,9 +234,11 @@ class AgentBarApp:
         main.addItem_(edit_item)
 
         win_menu = NSMenu.alloc().initWithTitle_("Window")
-        close_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Close Window", "performClose:", "w")
-        win_menu.addItem_(close_it)
+        for mask in (NSEventModifierFlagCommand, NSEventModifierFlagControl):
+            close_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Close Window", "performClose:", "w")
+            close_it.setKeyEquivalentModifierMask_(mask)
+            win_menu.addItem_(close_it)
         win_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Window", None, "")
         win_item.setSubmenu_(win_menu)
         main.addItem_(win_item)
@@ -194,6 +263,14 @@ class AgentBarApp:
         if snap is None:
             return
         self._item.button().setTitle_(build_title(snap))
+        outer, inner = build_ring_progress(snap)
+        key = (
+            None if outer is None else round(outer, 2),
+            None if inner is None else round(inner, 2),
+        )
+        if key != self._ring_key:
+            self._ring_key = key
+            self._item.button().setImage_(_ring_icon(outer, inner))
 
     def _rebuild_menu(self) -> None:
         if self._menu is None:

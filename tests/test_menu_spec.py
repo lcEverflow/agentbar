@@ -2,7 +2,9 @@
 
 import time
 
-from agentbar.menu_spec import build_menu_spec, build_title
+import pytest
+
+from agentbar.menu_spec import build_menu_spec, build_ring_progress, build_title
 
 BASE_SNAPSHOT = {
     "status": "idle",
@@ -142,3 +144,42 @@ def test_title_hides_stale_usage():
                    "source": "usage_api", "fetched_at": time.time() - 3600,
                    "plan": None, "detail": "", "error": None}})
     assert "%" not in build_title(snap)
+
+
+def _qi(percent=None, state="ok", fetched_at=None):
+    windows = [] if percent is None else [
+        {"label": "5h", "used_percent": percent, "resets_at": None}]
+    return {"state": state, "windows": windows, "fetched_at": fetched_at,
+            "source": "usage_api", "plan": None, "detail": "", "error": None}
+
+
+def test_ring_progress_fresh_usage_both_tools():
+    now = time.time()
+    outer, inner = build_ring_progress(_snap(quota={
+        "claude": _qi(37.0, fetched_at=now),
+        "codex": _qi(80.5, fetched_at=now),
+    }))
+    assert outer == pytest.approx(0.37)
+    assert inner == pytest.approx(0.805)
+
+
+def test_ring_progress_stale_or_missing_is_none():
+    outer, inner = build_ring_progress(_snap(quota={
+        "claude": _qi(37.0, fetched_at=time.time() - 3600),  # 过期 → 不显示
+    }))
+    assert outer is None and inner is None
+    assert build_ring_progress(_snap()) == (None, None)
+
+
+def test_ring_progress_limited_without_windows_is_full():
+    """observed 限流但没有 usage 窗口数据 → 画满环表示已打满。"""
+    outer, inner = build_ring_progress(_snap(quota={
+        "codex": _qi(None, state="limited"),
+    }))
+    assert outer is None and inner == 1.0
+
+
+def test_ring_progress_clamped():
+    now = time.time()
+    outer, _ = build_ring_progress(_snap(quota={"claude": _qi(120.0, fetched_at=now)}))
+    assert outer == 1.0
