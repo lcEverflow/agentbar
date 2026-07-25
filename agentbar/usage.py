@@ -1,8 +1,9 @@
 """Real quota/usage fetchers — approach mirrored from ylab/aiusagebar (Swift).
 
 Claude:  GET https://api.anthropic.com/api/oauth/usage
-         凭据链: env CLAUDE_CODE_OAUTH_TOKEN → ~/.claude/.credentials.json
-                → macOS Keychain "Claude Code-credentials"（默认静默读取，不弹窗）
+         凭据链: env CLAUDE_CODE_OAUTH_TOKEN → 本地缓存 ~/.agentbar/claude_credentials.json
+                → ~/.claude/.credentials.json
+                → macOS Keychain "Claude Code-credentials"（读到后写回本地缓存，避免反复弹窗）
          响应: {five_hour|seven_day|seven_day_opus|seven_day_sonnet:
                 {utilization: 0-100, resets_at: ISO8601}}
 
@@ -100,6 +101,36 @@ def _jwt_payload(token: str) -> dict:
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 
+# 本地凭据缓存：Keychain 成功读到一次后写回这里（0600），后续刷新只读文件、
+# 不再触碰 Keychain，从而避免 macOS 反复弹出"Python3 想访问 Claude Code-credentials"。
+CLAUDE_CRED_CACHE = Path.home() / ".agentbar" / "claude_credentials.json"
+
+
+def _cache_read_credentials() -> dict | None:
+    """读取本地凭据缓存；过期或损坏返回 None。"""
+    try:
+        creds = json.loads(CLAUDE_CRED_CACHE.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(creds, dict) or not (creds.get("token") or "").strip():
+        return None
+    exp = creds.get("expires_at")
+    if exp and exp < time.time():
+        return None
+    return creds
+
+
+def _cache_write_credentials(creds: dict) -> None:
+    """把凭据写入本地缓存文件（0600 权限，仅当前用户可读）。"""
+    try:
+        CLAUDE_CRED_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CLAUDE_CRED_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(creds), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CLAUDE_CRED_CACHE)
+    except OSError:
+        log.warning("写入 Claude 凭据缓存失败: %s", CLAUDE_CRED_CACHE, exc_info=True)
+
 
 def _keychain_read(interactive: bool = False) -> bytes | None:
     """静默读取 Keychain（interactive=True 允许系统弹窗授权，仅由用户显式触发）。"""
@@ -155,6 +186,10 @@ class ClaudeUsageFetcher:
             token = (os.environ.get(env_key) or "").strip()
             if token:
                 return {"token": token, "expires_at": None, "plan": None}
+        # 本地缓存优先：命中且未过期就直接返回，完全不碰 Keychain（无弹窗）。
+        cached = _cache_read_credentials()
+        if cached:
+            return cached
         cred_file = Path.home() / ".claude" / ".credentials.json"
         if cred_file.exists():
             try:
@@ -165,7 +200,11 @@ class ClaudeUsageFetcher:
                 return creds
         raw = _keychain_read(interactive=interactive)
         if raw:
-            return _parse_claude_credentials(raw)
+            creds = _parse_claude_credentials(raw)
+            if creds:
+                # 读到即写回缓存：下次刷新走文件，不再触发 Keychain 授权弹窗。
+                _cache_write_credentials(creds)
+            return creds
         return None
 
     def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
