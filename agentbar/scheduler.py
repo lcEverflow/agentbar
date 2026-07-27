@@ -389,7 +389,14 @@ class Scheduler:
             "queued": n_queued,
             "waiting_quota": n_waiting,
             "tasks": tasks,
-            "quota": {name: self.quota.status(name).to_dict() for name in self.registry},
+            "quota": {
+                name: self.quota.status(name).to_dict()
+                # 任务 adapter（claude/codex）+ 仅额度的 corp provider（mytoken/tokenverse）
+                for name in dict.fromkeys(
+                    list(self.registry) + self.quota.provider_tools()
+                )
+            },
+            "title_provider": self.settings.title_provider,
             "cli_processes": self._cli_processes_snapshot(),
             "settings": {
                 "max_parallel": self.settings.max_parallel,

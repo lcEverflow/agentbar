@@ -36,13 +36,23 @@ HTTP_TIMEOUT = 12
 
 @dataclass
 class UsageWindow:
-    label: str                 # "5h" | "7d" | "7d Opus" | "7d Sonnet"
+    label: str                 # "5h" | "7d" | "7d Opus" | "7d Sonnet" | "本月"
     used_percent: float
     resets_at: float | None = None
+    # 信用额度类 provider（MyToken / Tokenverse）附带原始额度值，供 UI 按 unit 展示。
+    used: float | None = None       # 已用（credits 或 token 数）
+    total: float | None = None      # 总额度
+    unit: str | None = None         # "credits" | "percent" | "token"
 
     def to_dict(self) -> dict:
-        return {"label": self.label, "used_percent": round(self.used_percent, 1),
-                "resets_at": self.resets_at}
+        return {
+            "label": self.label,
+            "used_percent": round(self.used_percent, 1),
+            "resets_at": self.resets_at,
+            "used": self.used,
+            "total": self.total,
+            "unit": self.unit,
+        }
 
 
 @dataclass
@@ -362,5 +372,211 @@ class CodexUsageFetcher:
         return snap
 
 
-def get_usage_fetchers() -> dict[str, object]:
-    return {"claude": ClaudeUsageFetcher(), "codex": CodexUsageFetcher()}
+# ================= 快手内部 provider（MyToken / Tokenverse） =================
+#
+# 两者都是凭 corp SSO cookie 访问的「月度信用额度」接口，响应统一为
+# {status, message, data} 信封（status==200 为成功）。诚实原则同上：cookie 缺失
+# 或接口失败 → 返回带 error 的 UsageSnapshot，绝不编造额度。
+#
+# used_percent 始终按「信用额度」算（驱动环形进度 + 限额判定）；window 附带
+# used/total/unit 供 UI 按用户选择的 unit（credits/percent/token）展示表头数字。
+
+
+def _corp_envelope(url: str, cookie: str, extra_headers: dict | None = None) -> dict:
+    """请求 corp 接口并校验 {status,message,data} 信封，返回 data；失败抛 RuntimeError。"""
+    headers = {
+        "Cookie": cookie,
+        "Accept": "application/json",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    body = _http_get_json(url, headers)
+    status = body.get("status")
+    if status != 200:
+        raise RuntimeError(body.get("message") or f"接口返回 status={status}")
+    if body.get("data") is None:
+        raise RuntimeError("接口响应缺少 data")
+    return body["data"]
+
+
+def _month_start_str(now: float | None = None) -> str:
+    lt = time.localtime(now if now is not None else time.time())
+    return time.strftime("%Y-%m-01", lt)
+
+
+def _next_month_start(now: float | None = None) -> float:
+    lt = time.localtime(now if now is not None else time.time())
+    year, month = lt.tm_year, lt.tm_mon
+    if month == 12:
+        year, month = year + 1, 1
+    else:
+        month += 1
+    return time.mktime((year, month, 1, 0, 0, 0, 0, 0, -1))
+
+
+def _credit_window(used: float, total: float | None, unit: str,
+                   resets_at: float | None, token_used: float | None,
+                   label: str = "本月") -> UsageWindow:
+    """把「信用额度用量」组装成一个展示窗口；used_percent 恒按 credits 算。"""
+    if total and total > 0:
+        pct = max(0.0, min(100.0, used / total * 100.0))
+    else:
+        pct = 0.0
+    if unit == "token":
+        disp_used, disp_total = (token_used if token_used is not None else 0.0), None
+    elif unit == "percent":
+        disp_used, disp_total = pct, 100.0
+    else:  # credits
+        disp_used, disp_total = used, total
+    return UsageWindow(label=label, used_percent=pct, resets_at=resets_at,
+                       used=disp_used, total=disp_total, unit=unit)
+
+
+class MyTokenUsageFetcher:
+    """MyToken（mytoken.corp.kuaishou.com）月度信用额度。"""
+
+    tool = "mytoken"
+    BASE = "https://mytoken.corp.kuaishou.com"
+
+    def __init__(self, cookie: str = "", unit: str = "credits",
+                 refresh_seconds: int = 300):
+        self.cookie = (cookie or "").strip()
+        self.unit = unit if unit in ("credits", "percent", "token") else "credits"
+        self.refresh_seconds = max(60, int(refresh_seconds or 300))
+
+    def _username(self) -> str:
+        data = _corp_envelope(
+            f"{self.BASE}/api/auth/sso/user", self.cookie,
+            {"Referer": f"{self.BASE}/usage"},
+        )
+        name = (data.get("name") or data.get("username") or data.get("userName")
+                or data.get("loginName") or "").strip()
+        if not name:
+            raise RuntimeError("SSO 用户接口未返回用户名")
+        return name
+
+    def _monthly_tokens(self, username: str) -> float | None:
+        start = _next_month_start() - 1  # 仅用于本月窗口，取月初到现在
+        month_start_ms = int(time.mktime(time.strptime(_month_start_str(), "%Y-%m-%d")) * 1000)
+        now_ms = int(time.time() * 1000)
+        url = (f"{self.BASE}/api/v1/billing/usage/token-summary"
+               f"?granularity=day&startTime={month_start_ms}&endTime={now_ms}")
+        try:
+            data = _corp_envelope(url, self.cookie, {"kwaipilot-username": username})
+        except (RuntimeError, urllib.error.URLError, OSError):
+            return None
+        buckets = data.get("buckets") or []
+        return float(sum((b.get("totalTokens") or 0) for b in buckets))
+
+    def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
+        if not self.cookie:
+            return UsageSnapshot(self.tool, source="mytoken_api",
+                                 error="未配置 cookie（config.json → providers.mytoken.cookie）")
+        try:
+            username = self._username()
+            data = _corp_envelope(
+                f"{self.BASE}/api/v1/billing/account", self.cookie,
+                {"kwaipilot-username": username},
+            )
+        except urllib.error.HTTPError as e:
+            return UsageSnapshot(self.tool, source="mytoken_api", error=f"HTTP {e.code}")
+        except (RuntimeError, urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+            return UsageSnapshot(self.tool, source="mytoken_api", error=str(e))
+
+        summary = data.get("summary") or {}
+        account = data.get("account") or {}
+        total = summary.get("creditTotal")
+        used = summary.get("creditUsed")
+        if used is None or total is None:
+            return UsageSnapshot(self.tool, source="mytoken_api",
+                                 error="account 接口未返回 creditUsed/creditTotal")
+        renew_ms = summary.get("renewAt")
+        token_used = self._monthly_tokens(username) if self.unit == "token" else None
+        window = _credit_window(
+            float(used), float(total), self.unit,
+            resets_at=(renew_ms / 1000.0) if renew_ms else _next_month_start(),
+            token_used=token_used,
+        )
+        plan = account.get("tierName") or account.get("tierCode")
+        return UsageSnapshot(
+            self.tool, windows=[window], plan=plan, source="mytoken_api",
+            limited=bool(window.used_percent >= 99.9),
+        )
+
+
+class TokenverseUsageFetcher:
+    """Tokenverse（tokenverse.corp.kuaishou.com）月度信用额度。"""
+
+    tool = "tokenverse"
+    BASE = "https://tokenverse.corp.kuaishou.com"
+
+    def __init__(self, cookie: str = "", unit: str = "credits",
+                 refresh_seconds: int = 300):
+        self.cookie = (cookie or "").strip()
+        self.unit = unit if unit in ("credits", "percent", "token") else "credits"
+        self.refresh_seconds = max(60, int(refresh_seconds or 300))
+
+    _PLAN_NAMES = {1: "Standard"}
+
+    def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
+        if not self.cookie:
+            return UsageSnapshot(self.tool, source="tokenverse_api",
+                                 error="未配置 cookie（config.json → providers.tokenverse.cookie）")
+        try:
+            plan = _corp_envelope(f"{self.BASE}/api/coding-plan/status", self.cookie)
+            summary = _corp_envelope(
+                f"{self.BASE}/api/coding-plan/usage/summary?startDate={_month_start_str()}",
+                self.cookie,
+            )
+        except urllib.error.HTTPError as e:
+            return UsageSnapshot(self.tool, source="tokenverse_api", error=f"HTTP {e.code}")
+        except (RuntimeError, urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+            return UsageSnapshot(self.tool, source="tokenverse_api", error=str(e))
+
+        monthly = plan.get("monthlyCredits")
+        if monthly is None:
+            monthly = (plan.get("openModelCreditsPerMon") or 0) + (
+                plan.get("closedSourceMonthlyCredits")
+                or plan.get("closeModelCreditsPerMon") or 0
+            )
+        used = summary.get("totalCredits")
+        if used is None:
+            return UsageSnapshot(self.tool, source="tokenverse_api",
+                                 error="usage summary 未返回 totalCredits")
+        token_used = (float(summary.get("totalTokens") or 0)
+                      if self.unit == "token" else None)
+        window = _credit_window(
+            float(used), float(monthly or 0), self.unit,
+            resets_at=_next_month_start(), token_used=token_used,
+        )
+        return UsageSnapshot(
+            self.tool, windows=[window],
+            plan=self._PLAN_NAMES.get(plan.get("planType")),
+            source="tokenverse_api",
+            limited=bool(window.used_percent >= 99.9),
+        )
+
+
+_CORP_FETCHERS = {
+    "mytoken": MyTokenUsageFetcher,
+    "tokenverse": TokenverseUsageFetcher,
+}
+
+
+def get_usage_fetchers(settings=None) -> dict[str, object]:
+    """内置 claude/codex，外加 config 里 enabled 且已配 cookie 的 corp provider。"""
+    fetchers: dict[str, object] = {
+        "claude": ClaudeUsageFetcher(),
+        "codex": CodexUsageFetcher(),
+    }
+    providers = getattr(settings, "providers", None) or {}
+    for name, cls in _CORP_FETCHERS.items():
+        cfg = providers.get(name) or {}
+        if cfg.get("enabled") and (cfg.get("cookie") or "").strip():
+            fetchers[name] = cls(
+                cookie=cfg.get("cookie", ""),
+                unit=cfg.get("unit", "credits"),
+                refresh_seconds=cfg.get("refresh_seconds", 300),
+            )
+    return fetchers

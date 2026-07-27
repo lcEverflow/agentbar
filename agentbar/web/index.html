@@ -213,16 +213,36 @@ function taskTool(t) {
   return `<b>${esc(t.tool)}</b><div class="taskChoice">${esc(choice)}</div>`;
 }
 
+const PROVIDER_NAMES = { claude:"Claude Code", codex:"Codex", mytoken:"MyToken", tokenverse:"Tokenverse" };
+
+function humanNum(n) {
+  n = Number(n) || 0;
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n/1e9).toFixed(1)+"B";
+  if (abs >= 1e6) return (n/1e6).toFixed(1)+"M";
+  if (abs >= 1e3) return (n/1e3).toFixed(1)+"K";
+  return n.toFixed(0);
+}
+
+function windowValue(w) {
+  if (w.unit === "credits" && w.used != null)
+    return (w.total ? humanNum(w.used)+"/"+humanNum(w.total) : humanNum(w.used)) + " credits";
+  if (w.unit === "token" && w.used != null) return humanNum(w.used) + " tok";
+  return (Number(w.used_percent)||0).toFixed(0) + "%";
+}
+
 function quotaCards(quota) {
-  return ["claude", "codex"].map(tool => {
+  const tools = ["claude", "codex"].filter(t => quota[t])
+    .concat(Object.keys(quota).filter(t => t !== "claude" && t !== "codex"));
+  return tools.map(tool => {
     const qi = quota[tool];
     if (!qi) return "";
     const windows = (qi.windows || []).map(w => {
       const pct = Math.max(0, Math.min(100, Number(w.used_percent) || 0));
       const warn = pct >= 90 ? "warn" : "";
-      return `<div class="quotaWindow"><span class="dim">${esc(w.label)}</span><span class="meter ${warn}"><i style="width:${pct}%"></i></span><span>${pct.toFixed(0)}%</span></div><div class="dim">${w.resets_at ? `重置：${dateClock(w.resets_at)}` : "未提供重置时间"}</div>`;
+      return `<div class="quotaWindow"><span class="dim">${esc(w.label)}</span><span class="meter ${warn}"><i style="width:${pct}%"></i></span><span>${esc(windowValue(w))}</span></div><div class="dim">${w.resets_at ? `重置：${dateClock(w.resets_at)}` : "未提供重置时间"}</div>`;
     }).join("");
-    return `<div class="quotaCard"><div class="quotaTitle"><b>${tool === "claude" ? "Claude Code" : "Codex"}</b><span class="origin">${esc(qi.source || "unknown")}</span></div>${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}` : "未取得实时数据"}</div></div>`;
+    return `<div class="quotaCard"><div class="quotaTitle"><b>${esc(PROVIDER_NAMES[tool] || tool)}</b><span class="origin">${esc(qi.source || "unknown")}</span></div>${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}` : "未取得实时数据"}</div></div>`;
   }).join("");
 }
 

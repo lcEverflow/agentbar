@@ -46,9 +46,21 @@ def _submenu(title: str, children: list[dict]) -> dict:
             "enabled": True, "children": children}
 
 
-def build_title(snapshot: dict) -> str:
-    """状态栏标题：只放文字（运行数>1 的数字 + Claude 用量）。
+# provider 名 → 菜单/标题展示名
+_PROVIDER_NAMES = {
+    "claude": "Claude", "codex": "Codex",
+    "mytoken": "MyToken", "tokenverse": "Tokenverse",
+}
 
+
+def _provider_name(tool: str) -> str:
+    return _PROVIDER_NAMES.get(tool, tool.capitalize())
+
+
+def build_title(snapshot: dict) -> str:
+    """状态栏标题：只放文字（运行数>1 的数字 + 选定 provider 的用量）。
+
+    展示哪个 provider 由 settings.title_provider 决定（默认 claude）。
     状态图形全部在双环图标里（环心实心点=运行中、双竖条=已暂停），
     标题不再放 ◇/◆/◐/Ⅱ 字符——否则菜单栏看起来像两个图标。
     """
@@ -56,18 +68,20 @@ def build_title(snapshot: dict) -> str:
     n_run = len(snapshot.get("running_titles") or [])
     if n_run > 1:
         parts.append(str(n_run))
-    claude = (snapshot.get("quota") or {}).get("claude") or {}
-    fetched = claude.get("fetched_at")
-    windows = claude.get("windows") or []
-    state = claude.get("state", "")
-    if windows and fetched and time.time() - fetched < TITLE_USAGE_STALE:
+    tool = snapshot.get("title_provider") or "claude"
+    qi = (snapshot.get("quota") or {}).get(tool) or {}
+    fetched = qi.get("fetched_at")
+    windows = qi.get("windows") or []
+    state = qi.get("state", "")
+    fresh = fetched and time.time() - fetched < TITLE_USAGE_STALE
+    if windows and fresh:
         primary = windows[0]
         if primary.get("used_percent") is not None:
             parts.append(f"{primary['used_percent']:.0f}%")
     elif state == "limited":
         parts.append("限额")
-    elif state == "ok" and fetched and time.time() - fetched < TITLE_USAGE_STALE:
-        parts.append("Claude✓")
+    elif state == "ok" and fresh:
+        parts.append(f"{_provider_name(tool)}✓")
     return " ".join(parts)
 
 
@@ -95,11 +109,31 @@ def build_ring_progress(snapshot: dict) -> tuple[float | None, float | None]:
     return _ring_progress(quota.get("claude")), _ring_progress(quota.get("codex"))
 
 
+def _human(n: float) -> str:
+    n = float(n)
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(n) >= div:
+            return f"{n / div:.1f}{unit}"
+    return f"{n:.0f}"
+
+
+def _window_value(w: dict) -> str:
+    """按 window 的 unit 渲染表头数字：credits/token 显示原始额度，否则百分比。"""
+    unit = w.get("unit")
+    used, total = w.get("used"), w.get("total")
+    if unit == "credits" and used is not None:
+        base = f"{_human(used)}/{_human(total)}" if total else _human(used)
+        return f"{base} credits"
+    if unit == "token" and used is not None:
+        return f"{_human(used)} tok"
+    return f"{w['used_percent']:.0f}%"
+
+
 def _quota_compact(qi: dict) -> str:
     windows = qi.get("windows") or []
     if windows:
         return " · ".join(
-            f"{w['label']} {w['used_percent']:.0f}%" for w in windows[:2]
+            f"{w['label']} {_window_value(w)}" for w in windows[:2]
         )
     return {"ok": "正常", "limited": "受限", "unknown": "未知"}.get(qi.get("state"), "未知")
 
@@ -108,7 +142,9 @@ def _quota_submenu(tool: str, qi: dict) -> dict:
     dot = {"ok": "🟢", "limited": "🟠"}.get(qi.get("state"), "⚪")
     children: list[dict] = []
     for w in qi.get("windows") or []:
-        line = f"{w['label']} 已用 {w['used_percent']:.0f}%"
+        line = f"{w['label']} 已用 {_window_value(w)}"
+        if w.get("unit") in ("credits", "token"):
+            line += f"（{w['used_percent']:.0f}%）"
         if w.get("resets_at"):
             line += f" · {_clock(w['resets_at'])} 重置"
         children.append(_action(line))
@@ -127,7 +163,7 @@ def _quota_submenu(tool: str, qi: dict) -> dict:
     children.append(_action("↻ 立即刷新额度", "refresh_quota"))
     if tool == "claude" and "Keychain" in (qi.get("error") or ""):
         children.append(_action("🔑 授权读取 Claude Keychain…", "authorize_keychain"))
-    return _submenu(f"{dot} {tool.capitalize()} · {_quota_compact(qi)}", children)
+    return _submenu(f"{dot} {_provider_name(tool)} · {_quota_compact(qi)}", children)
 
 
 def _mobile_submenu(t: dict) -> dict:
@@ -179,11 +215,17 @@ def build_menu_spec(snapshot: dict) -> list[dict]:
     rows.append(_sep())
 
     quota = snapshot.get("quota") or {}
-    for tool in ("claude", "codex"):
+    # claude/codex 优先，其余 corp provider（mytoken/tokenverse…）按 key 顺序附后
+    ordered = [t for t in ("claude", "codex") if t in quota] + [
+        t for t in quota if t not in ("claude", "codex")
+    ]
+    shown = False
+    for tool in ordered:
         qi = quota.get(tool)
         if qi:
             rows.append(_quota_submenu(tool, qi))
-    if any(tool in quota for tool in ("claude", "codex")):
+            shown = True
+    if shown:
         rows.append(_sep())
 
     rows.append(_action("↗ 打开任务面板", "open_panel"))

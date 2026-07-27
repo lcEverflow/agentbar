@@ -40,7 +40,7 @@ def core(settings):
     from agentbar import quota as quota_module
 
     original_fetchers = quota_module.get_usage_fetchers
-    quota_module.get_usage_fetchers = lambda: {}
+    quota_module.get_usage_fetchers = lambda *a, **k: {}
     store = StateStore(settings.state_dir)
     c = Scheduler(settings, store)
     c.start()

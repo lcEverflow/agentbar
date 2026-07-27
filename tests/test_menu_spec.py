@@ -193,3 +193,38 @@ def test_ring_progress_clamped():
     now = time.time()
     outer, _ = build_ring_progress(_snap(quota={"claude": _qi(120.0, fetched_at=now)}))
     assert outer == 1.0
+
+
+# ---------- corp provider 展示（credits/token 单位 + 自定义标题 provider） ----------
+
+from agentbar.menu_spec import build_menu_spec, build_title  # noqa: E402
+
+
+def _corp_snapshot(**title):
+    now = __import__("time").time()
+    return {
+        "status": "idle", "queued": 0, "waiting_quota": 0, "running_titles": [],
+        "tasks": [], "tunnel": {},
+        "quota": {
+            "mytoken": {
+                "state": "ok", "source": "mytoken_api", "fetched_at": now,
+                "windows": [{"label": "本月", "used_percent": 25.0,
+                             "resets_at": now + 86400, "used": 250, "total": 1000,
+                             "unit": "credits"}],
+            },
+        },
+        **title,
+    }
+
+
+def test_menu_shows_corp_provider_credits():
+    rows = build_menu_spec(_corp_snapshot())
+    titles = [r["title"] for r in rows]
+    assert any("MyToken" in t and "credits" in t for t in titles)
+
+
+def test_title_provider_selectable():
+    snap = _corp_snapshot(title_provider="mytoken")
+    assert build_title(snap) == "25%"
+    # 默认（claude）无数据 → 空标题
+    assert build_title(_corp_snapshot()) == ""

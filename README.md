@@ -152,9 +152,35 @@ agentbar.log   # 调度器日志
   "task_timeout_seconds": 7200,
   "backoff_minutes": [5, 15, 30, 60],
   "usage_refresh_seconds": 120,
-  "tool_paths": {}          // {"claude": "/abs/path"} 手动覆盖
+  "tool_paths": {},         // {"claude": "/abs/path"} 手动覆盖
+  "title_provider": "claude",   // 状态栏标题显示哪个 provider 的用量：claude/codex/mytoken/tokenverse
+  "providers": {            // 快手内部额度 provider（默认关闭，贴 cookie 并 enabled 后展示）
+    "mytoken": {
+      "enabled": false,
+      "cookie": "",         // corp SSO cookie 头（浏览器 DevTools 复制整行 Cookie）
+      "unit": "credits",    // 展示单位：credits / percent / token
+      "refresh_seconds": 300
+    },
+    "tokenverse": {
+      "enabled": false,
+      "cookie": "",
+      "unit": "credits",
+      "refresh_seconds": 300
+    }
+  }
 }
 ```
+
+### 快手内部额度：MyToken / Tokenverse
+
+除订阅版 Claude / Codex 外，AgentBar 支持展示两个快手内部工具的月度信用额度（credits）：
+
+| provider | 接口 | 鉴权 |
+| ---- | ---- | ---- |
+| **MyToken** | `mytoken.corp.kuaishou.com` — `/api/auth/sso/user` → `/api/v1/billing/account` | corp SSO cookie + `kwaipilot-username` 头（自动带） |
+| **Tokenverse** | `tokenverse.corp.kuaishou.com` — `/api/coding-plan/status` + `/api/coding-plan/usage/summary` | corp SSO cookie |
+
+启用方式：在 `~/.agentbar/config.json` 的 `providers.<name>` 里把 `enabled` 置 `true`、把浏览器登录态的 Cookie 整行贴进 `cookie`，重启即可。每个 provider 可独立配置展示单位（`credits`/`percent`/`token`）与刷新间隔。诚实原则不变：cookie 缺失或接口失败时如实显示错误，绝不编造额度。接口契约参考 [ylab/aiusagebar](https://git.corp.kuaishou.com/ylab/aiusagebar)。
 
 ## 扩展新的 AI CLI
 

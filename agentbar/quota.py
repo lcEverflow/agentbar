@@ -69,12 +69,18 @@ class QuotaMonitor:
         # {tool: {"last_success_at": float, "last_quota_at": float, "reset_at": float}}
         self._obs: dict[str, dict] = {}
         self._usage: dict[str, UsageSnapshot] = {}
-        self._fetchers = get_usage_fetchers()
+        self._fetchers = get_usage_fetchers(settings)
+        self._next_due: dict[str, float] = {}   # 各 provider 的下次到期刷新时刻（per-provider 间隔）
+        self._force_refresh = False             # refresh_now 触发时强制刷新全部
         self._ccusage: dict | None = None
         self._ccusage_bin = shutil.which("ccusage")
         self._stop = threading.Event()
         self._refresh_evt = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def provider_tools(self) -> list[str]:
+        """本监视器能上报额度的全部工具名（含 corp provider）。"""
+        return list(self._fetchers)
 
     # ---------- persistence (由 scheduler 存进 state.json) ----------
 
@@ -188,7 +194,8 @@ class QuotaMonitor:
         self._refresh_evt.set()
 
     def refresh_now(self) -> None:
-        """异步触发一次立即刷新（任务结束/用户点菜单时调用）。"""
+        """异步触发一次立即刷新（任务结束/用户点菜单时调用）——强制刷新全部 provider。"""
+        self._force_refresh = True
         self._refresh_evt.set()
 
     def authorize_claude_keychain(self) -> bool:
@@ -218,7 +225,17 @@ class QuotaMonitor:
             self._refresh_all()
 
     def _refresh_all(self) -> None:
+        force = self._force_refresh
+        self._force_refresh = False
+        now = time.time()
         for tool, fetcher in self._fetchers.items():
+            # per-provider 刷新间隔：设了 refresh_seconds 的（corp provider）未到期就跳过，
+            # 除非用户显式 refresh_now 强制刷新。claude/codex 无此属性 → 每轮都刷。
+            interval = getattr(fetcher, "refresh_seconds", None)
+            if not force and interval and now < self._next_due.get(tool, 0):
+                continue
+            if interval:
+                self._next_due[tool] = now + interval
             try:
                 snap = fetcher.fetch()
             except Exception as e:  # 任何异常都不能带崩后台线程
