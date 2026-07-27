@@ -28,6 +28,15 @@
   .quotaCard { background:#16191f; border:1px solid var(--line); border-radius:8px; padding:10px; }
   .quotaTitle { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
   .quotaWindow { display:grid; grid-template-columns:52px 1fr 38px; gap:7px; align-items:center; margin:5px 0; }
+  .providerGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:10px; }
+  .providerCard { background:#16191f; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .providerCard .row { display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+  .providerTop { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .providerTop label { display:flex; align-items:center; gap:6px; font-weight:600; }
+  .providerTop input { min-width:0; flex:0; }
+  .providerActions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+  .providerCookie { min-height:46px; font-family:ui-monospace,Menlo,monospace; }
+  .providerStatus { min-height:18px; margin-top:6px; }
   .meter { height:6px; border-radius:6px; overflow:hidden; background:#2a2f37; }
   .meter > i { display:block; height:100%; background:var(--blue); border-radius:inherit; }
   .meter.warn > i { background:var(--amber); }
@@ -116,6 +125,19 @@
     <div class="sectionHead"><h2>订阅额度</h2><span class="dim">真实接口数据，默认每 120 秒刷新；获取失败会明确显示，不估算或伪造。</span>
       <div class="spacer"></div><button class="mini" id="btnAuthorizeClaude" style="display:none">授权读取 Claude Keychain…</button></div>
     <div class="quotaGrid" id="quotaGrid"></div>
+  </section>
+  <section>
+    <div class="sectionHead"><h2>内部额度配置</h2><span class="dim">MyToken / Tokenverse 使用本机浏览器登录态；Cookie 只保存在 ~/.agentbar/config.json。</span>
+      <div class="spacer"></div>
+      <select id="titleProvider" title="菜单栏标题显示哪个 provider 的用量">
+        <option value="claude">标题：Claude</option>
+        <option value="codex">标题：Codex</option>
+        <option value="mytoken">标题：MyToken</option>
+        <option value="tokenverse">标题：Tokenverse</option>
+      </select>
+      <button class="mini primary" id="btnSaveProviders">保存并刷新</button>
+    </div>
+    <div class="providerGrid" id="providerGrid"></div>
   </section>
   <section>
     <h2>进行中 / 队列</h2>
@@ -214,6 +236,7 @@ function taskTool(t) {
 }
 
 const PROVIDER_NAMES = { claude:"Claude Code", codex:"Codex", mytoken:"MyToken", tokenverse:"Tokenverse" };
+let providerConfig = null;
 
 function humanNum(n) {
   n = Number(n) || 0;
@@ -245,6 +268,107 @@ function quotaCards(quota) {
     return `<div class="quotaCard"><div class="quotaTitle"><b>${esc(PROVIDER_NAMES[tool] || tool)}</b><span class="origin">${esc(qi.source || "unknown")}</span></div>${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}` : "未取得实时数据"}</div></div>`;
   }).join("");
 }
+
+function renderProviderConfig(cfg) {
+  providerConfig = cfg;
+  $("titleProvider").value = cfg.title_provider || "claude";
+  const providers = cfg.providers || {};
+  $("providerGrid").innerHTML = ["mytoken", "tokenverse"].map(name => {
+    const p = providers[name] || {};
+    const label = PROVIDER_NAMES[name] || name;
+    const cookieState = p.cookie_set
+      ? `已配置 Cookie：${esc(p.cookie_preview || "已保存")}`
+      : "未配置 Cookie";
+    return `<div class="providerCard" data-provider="${name}">
+      <div class="providerTop">
+        <label><input type="checkbox" id="p-${name}-enabled" ${p.enabled ? "checked" : ""}/> ${esc(label)}</label>
+        <span class="origin">${esc(p.host || "")}</span>
+      </div>
+      <div class="row">
+        <select id="p-${name}-unit" title="展示单位">
+          <option value="credits" ${p.unit === "credits" ? "selected" : ""}>credits</option>
+          <option value="percent" ${p.unit === "percent" ? "selected" : ""}>percent</option>
+          <option value="token" ${p.unit === "token" ? "selected" : ""}>token</option>
+        </select>
+        <input id="p-${name}-refresh" type="number" min="60" step="30" value="${esc(p.refresh_seconds || 300)}" title="刷新间隔（秒）"/>
+      </div>
+      <textarea class="providerCookie" id="p-${name}-cookie" placeholder="可选：手动粘贴 ${esc(label)} 的 Request Headers Cookie；留空保存时不改已有 Cookie"></textarea>
+      <div class="providerActions">
+        <button class="mini" onclick="importProviderCookie('${name}')">从浏览器导入 Cookie</button>
+        <button class="mini" onclick="clearProviderCookie('${name}')">清空 Cookie</button>
+        <span class="dim">${cookieState}</span>
+      </div>
+      <div class="dim providerStatus" id="p-${name}-status"></div>
+    </div>`;
+  }).join("");
+}
+
+async function loadProviderConfig() {
+  try { renderProviderConfig(await api("/api/provider-config")); }
+  catch (e) { showBanner("无法读取内部额度配置: " + e.message); }
+}
+
+function providerPayload(includeEmptyCookie = false) {
+  const providers = {};
+  for (const name of ["mytoken", "tokenverse"]) {
+    const cookie = $(`p-${name}-cookie`).value.trim();
+    providers[name] = {
+      enabled: $(`p-${name}-enabled`).checked,
+      unit: $(`p-${name}-unit`).value,
+      refresh_seconds: Number($(`p-${name}-refresh`).value) || 300,
+    };
+    if (cookie || includeEmptyCookie) providers[name].cookie = cookie;
+  }
+  return { providers, title_provider: $("titleProvider").value };
+}
+
+async function saveProviderConfig(includeEmptyCookie = false) {
+  const j = await api("/api/provider-config", {
+    method:"POST",
+    body: JSON.stringify(providerPayload(includeEmptyCookie)),
+  });
+  renderProviderConfig(j);
+  await refresh();
+  return j;
+}
+
+window.importProviderCookie = async name => {
+  const status = $(`p-${name}-status`);
+  status.textContent = "正在从本机 Chrome/Edge/Brave 导入…";
+  try {
+    const j = await api("/api/provider-config/import-cookie", {
+      method:"POST",
+      body: JSON.stringify({ provider: name }),
+    });
+    renderProviderConfig(j);
+    await refresh();
+    alert(j.message || "导入完成");
+  } catch (e) {
+    status.textContent = e.message;
+    alert("导入失败: " + e.message);
+  }
+};
+
+window.clearProviderCookie = async name => {
+  if (!$(`p-${name}-cookie`)) return;
+  $(`p-${name}-cookie`).value = "";
+  $(`p-${name}-enabled`).checked = false;
+  const payload = providerPayload(false);
+  payload.providers = { [name]: {
+    enabled: false,
+    unit: $(`p-${name}-unit`).value,
+    refresh_seconds: Number($(`p-${name}-refresh`).value) || 300,
+    cookie: "",
+  } };
+  try {
+    const j = await api("/api/provider-config", {
+      method:"POST",
+      body: JSON.stringify(payload),
+    });
+    renderProviderConfig(j);
+    await refresh();
+  } catch (e) { alert("清空失败: " + e.message); }
+};
 
 function renderProcesses(processes) {
   $("processBody").innerHTML = (processes || []).map(p => `<tr><td><b>${esc(p.tool)}</b></td><td><span class="kind ${esc(p.kind)}">${p.kind === "managed" ? "AgentBar" : "外部"}</span></td><td class="mono">${esc(p.pid)}</td><td>${esc(p.state)}</td><td>${esc(p.elapsed)}</td><td class="mono dim">${esc(shorten(p.cwd || "—"))}</td><td>${p.title ? esc(p.title) : "<span class=\"dim\">外部任务（仅观测）</span>"}</td></tr>`).join("");
@@ -405,8 +529,9 @@ $("btnPause").onclick = () => api("/api/pause-all", { method:"POST" }).then(refr
 $("btnResume").onclick = () => api("/api/resume-all", { method:"POST" }).then(refresh).catch(e => alert(e.message));
 $("btnRefreshQuota").onclick = () => api("/api/quota/refresh", { method:"POST" }).then(refresh).catch(e => alert(e.message));
 $("btnAuthorizeClaude").onclick = () => api("/api/quota/authorize-claude", { method:"POST" }).then(refresh).catch(e => alert(e.message));
+$("btnSaveProviders").onclick = () => saveProviderConfig(false).catch(e => alert("保存失败: " + e.message));
 
-loadTools(); refresh(); setInterval(refresh, 2000);
+loadTools(); loadProviderConfig(); refresh(); setInterval(refresh, 2000);
 </script>
 </body>
 </html>

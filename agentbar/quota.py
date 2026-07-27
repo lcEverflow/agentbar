@@ -82,6 +82,17 @@ class QuotaMonitor:
         """本监视器能上报额度的全部工具名（含 corp provider）。"""
         return list(self._fetchers)
 
+    def reload_fetchers(self) -> None:
+        """Rebuild usage fetchers after settings.providers changes."""
+        with self._lock:
+            self._fetchers = get_usage_fetchers(self.settings)
+            self._next_due = {}
+            self._usage = {
+                tool: snap for tool, snap in self._usage.items()
+                if tool in self._fetchers
+            }
+        self.refresh_now()
+
     # ---------- persistence (由 scheduler 存进 state.json) ----------
 
     def load(self, data: dict) -> None:

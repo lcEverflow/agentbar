@@ -187,6 +187,65 @@ def test_quota_refresh_endpoint(api):
     assert code == 202 and j["ok"]
 
 
+def test_provider_config_endpoint_masks_cookie(api):
+    srv, s = api
+    s.providers["mytoken"].update({
+        "enabled": True,
+        "cookie": "SESSION=secret; token=hidden",
+        "unit": "credits",
+    })
+    code, j = _call(srv, "/api/provider-config", token=s.token)
+    assert code == 200
+    assert j["providers"]["mytoken"]["enabled"] is True
+    assert j["providers"]["mytoken"]["cookie_set"] is True
+    assert "SESSION" in j["providers"]["mytoken"]["cookie_preview"]
+    assert "secret" not in json.dumps(j)
+
+
+def test_provider_config_save_reloads_fetchers(api):
+    srv, s = api
+    reloaded = []
+    srv.core.quota.reload_fetchers = lambda: reloaded.append(True)
+    code, j = _call(srv, "/api/provider-config", "POST", s.token, {
+        "providers": {
+            "mytoken": {
+                "enabled": True,
+                "cookie": "c=1",
+                "unit": "percent",
+                "refresh_seconds": 90,
+            }
+        },
+        "title_provider": "mytoken",
+    })
+    assert code == 200, j
+    assert s.providers["mytoken"]["enabled"] is True
+    assert s.providers["mytoken"]["cookie"] == "c=1"
+    assert s.providers["mytoken"]["unit"] == "percent"
+    assert s.title_provider == "mytoken"
+    assert reloaded == [True]
+
+
+def test_provider_cookie_import_updates_config(api, monkeypatch):
+    from agentbar.browser_cookies import ImportedCookie
+
+    srv, s = api
+
+    def fake_import(host):
+        assert host == "tokenverse.corp.kuaishou.com"
+        return ImportedCookie("tv=1; sso=2", "Chrome / Default", 2)
+
+    monkeypatch.setattr("agentbar.server.import_cookie_header", fake_import)
+    reloaded = []
+    srv.core.quota.reload_fetchers = lambda: reloaded.append(True)
+    code, j = _call(srv, "/api/provider-config/import-cookie", "POST", s.token,
+                    {"provider": "tokenverse"})
+    assert code == 200, j
+    assert "2 个 Cookie" in j["message"]
+    assert s.providers["tokenverse"]["enabled"] is True
+    assert s.providers["tokenverse"]["cookie"] == "tv=1; sso=2"
+    assert reloaded == [True]
+
+
 def test_debug_dispatch_404_without_menubar(api):
     srv, s = api
     code, _ = _call(srv, "/api/debug/dispatch", "POST", s.token,

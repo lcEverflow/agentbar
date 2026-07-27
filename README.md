@@ -154,10 +154,10 @@ agentbar.log   # 调度器日志
   "usage_refresh_seconds": 120,
   "tool_paths": {},         // {"claude": "/abs/path"} 手动覆盖
   "title_provider": "claude",   // 状态栏标题显示哪个 provider 的用量：claude/codex/mytoken/tokenverse
-  "providers": {            // 快手内部额度 provider（默认关闭，贴 cookie 并 enabled 后展示）
+  "providers": {            // 快手内部额度 provider（默认关闭，可在面板一键导入 Cookie）
     "mytoken": {
       "enabled": false,
-      "cookie": "",         // corp SSO cookie 头（浏览器 DevTools 复制整行 Cookie）
+      "cookie": "",         // corp SSO cookie 头（面板导入或手动复制整行 Cookie）
       "unit": "credits",    // 展示单位：credits / percent / token
       "refresh_seconds": 300
     },
@@ -180,7 +180,7 @@ agentbar.log   # 调度器日志
 | **MyToken** | `mytoken.corp.kuaishou.com` — `/api/auth/sso/user` → `/api/v1/billing/account` | corp SSO cookie + `kwaipilot-username` 头（自动带） |
 | **Tokenverse** | `tokenverse.corp.kuaishou.com` — `/api/coding-plan/status` + `/api/coding-plan/usage/summary` | corp SSO cookie |
 
-启用方式：在 `~/.agentbar/config.json` 的 `providers.<name>` 里把 `enabled` 置 `true`、把浏览器登录态的 Cookie 整行贴进 `cookie`，重启即可。每个 provider 可独立配置展示单位（`credits`/`percent`/`token`）与刷新间隔。诚实原则不变：cookie 缺失或接口失败时如实显示错误，绝不编造额度。接口契约参考 [ylab/aiusagebar](https://git.corp.kuaishou.com/ylab/aiusagebar)。
+启用方式：打开 AgentBar 面板 → **内部额度配置**，可直接点“从浏览器导入 Cookie”读取本机 Chrome / Edge / Brave 登录态，也可手动粘贴浏览器 DevTools 里的整行 `Cookie`。保存后会立即重建 provider 并刷新额度，不需要手写 JSON 或重启。每个 provider 可独立配置展示单位（`credits`/`percent`/`token`）与刷新间隔。诚实原则不变：cookie 缺失或接口失败时如实显示错误，绝不编造额度。接口契约参考 [ylab/aiusagebar](https://git.corp.kuaishou.com/ylab/aiusagebar)。
 
 ## 扩展新的 AI CLI
 

@@ -19,13 +19,18 @@ from importlib import resources
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import __version__
-from .config import Settings
+from .browser_cookies import CookieImportError, import_cookie_header
+from .config import DEFAULT_PROVIDERS, PROVIDER_UNITS, Settings, save_settings
 from .scheduler import Scheduler
 
 log = logging.getLogger("agentbar.server")
 
 MAX_BODY = 200_000
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+PROVIDER_HOSTS = {
+    "mytoken": "mytoken.corp.kuaishou.com",
+    "tokenverse": "tokenverse.corp.kuaishou.com",
+}
 
 
 def _host_of(header: str) -> str:
@@ -55,6 +60,65 @@ def lan_ip() -> str | None:
         return None
     finally:
         s.close()
+
+
+def _cookie_preview(cookie: str) -> str:
+    if not cookie:
+        return ""
+    names = []
+    for part in cookie.split(";"):
+        name = part.strip().split("=", 1)[0].strip()
+        if name:
+            names.append(name)
+    shown = ", ".join(names[:4])
+    return shown + (" ..." if len(names) > 4 else "")
+
+
+def _provider_config_payload(settings: Settings) -> dict:
+    providers = {}
+    for name, defaults in DEFAULT_PROVIDERS.items():
+        cfg = (settings.providers or {}).get(name) or {}
+        cookie = str(cfg.get("cookie") or "")
+        providers[name] = {
+            "enabled": bool(cfg.get("enabled")),
+            "unit": cfg.get("unit") if cfg.get("unit") in PROVIDER_UNITS else defaults["unit"],
+            "refresh_seconds": int(cfg.get("refresh_seconds") or defaults["refresh_seconds"]),
+            "cookie_set": bool(cookie.strip()),
+            "cookie_preview": _cookie_preview(cookie),
+            "host": PROVIDER_HOSTS.get(name, ""),
+        }
+    return {
+        "ok": True,
+        "providers": providers,
+        "title_provider": settings.title_provider,
+    }
+
+
+def _apply_provider_settings(settings: Settings, payload: dict) -> None:
+    providers = payload.get("providers") or {}
+    merged = json.loads(json.dumps(settings.providers or DEFAULT_PROVIDERS))
+    for name, defaults in DEFAULT_PROVIDERS.items():
+        incoming = providers.get(name)
+        if not isinstance(incoming, dict):
+            continue
+        cfg = merged.setdefault(name, dict(defaults))
+        if "enabled" in incoming:
+            cfg["enabled"] = bool(incoming.get("enabled"))
+        if incoming.get("unit") in PROVIDER_UNITS:
+            cfg["unit"] = incoming["unit"]
+        if "refresh_seconds" in incoming:
+            try:
+                cfg["refresh_seconds"] = max(60, int(incoming.get("refresh_seconds") or 300))
+            except (TypeError, ValueError):
+                cfg["refresh_seconds"] = defaults["refresh_seconds"]
+        if "cookie" in incoming:
+            # Missing cookie keeps the existing secret; explicit empty string clears it.
+            cfg["cookie"] = str(incoming.get("cookie") or "").strip()
+    title = payload.get("title_provider")
+    if title in {"claude", "codex", *DEFAULT_PROVIDERS.keys()}:
+        settings.title_provider = title
+    settings.providers = merged
+    save_settings(settings)
 
 
 class ApiServer:
@@ -210,6 +274,9 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                                  "default_cwd": settings.default_cwd,
                                  "allow_full_profile": settings.allow_full_profile})
                 return
+            if path == "/api/provider-config":
+                self._json(200, _provider_config_payload(settings))
+                return
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"] and parts[4] == "log":
                 tail = min(int(q.get("tail_bytes", ["30000"])[0]), 200_000)
@@ -296,6 +363,44 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 self._json(200 if ok else 400, {
                     "ok": ok,
                     "message": "Claude Keychain 已授权并刷新" if ok else "未取得 Claude Keychain 授权",
+                })
+                return
+            if path == "/api/provider-config":
+                try:
+                    _apply_provider_settings(settings, body)
+                    core.quota.reload_fetchers()
+                except Exception as e:
+                    self._json(400, {"ok": False, "error": str(e)})
+                    return
+                self._json(200, {
+                    **_provider_config_payload(settings),
+                    "message": "额度配置已保存并刷新",
+                })
+                return
+            if path == "/api/provider-config/import-cookie":
+                provider = str(body.get("provider") or "")
+                host = PROVIDER_HOSTS.get(provider)
+                if not host:
+                    self._json(400, {"ok": False, "error": f"未知 provider: {provider!r}"})
+                    return
+                try:
+                    imported = import_cookie_header(host)
+                except CookieImportError as e:
+                    self._json(400, {"ok": False, "error": str(e)})
+                    return
+                cfg = settings.providers.setdefault(
+                    provider, dict(DEFAULT_PROVIDERS[provider])
+                )
+                cfg["enabled"] = True
+                cfg["cookie"] = imported.header
+                save_settings(settings)
+                core.quota.reload_fetchers()
+                self._json(200, {
+                    **_provider_config_payload(settings),
+                    "message": (
+                        f"已从 {imported.source} 导入 {imported.count} 个 Cookie，"
+                        f"{provider} 已启用"
+                    ),
                 })
                 return
             if path == "/api/debug/dispatch":
