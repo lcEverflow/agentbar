@@ -1,3 +1,7 @@
+import json
+import os
+import time
+
 from agentbar.usage import ClaudeUsageFetcher, CodexUsageFetcher
 
 
@@ -8,6 +12,91 @@ def test_claude_usage_parse_windows():
     }, plan="pro")
     assert snap.plan == "pro"
     assert [(w.label, w.used_percent) for w in snap.windows] == [("5h", 32.5), ("7d", 88.0)]
+
+
+def test_claude_keychain_parse_does_not_copy_refresh_token():
+    from agentbar.usage import _parse_claude_credentials
+
+    raw = json.dumps({"claudeAiOauth": {
+        "accessToken": "access-old",
+        "refreshToken": "refresh-long-lived",
+        "expiresAt": 1_800_000_000_000,
+        "subscriptionType": "pro",
+        "scopes": ["user:inference"],
+    }}).encode()
+    creds = _parse_claude_credentials(raw)
+    assert creds == {
+        "token": "access-old",
+        "expires_at": 1_800_000_000.0,
+        "plan": "pro",
+        "scopes": ["user:inference"],
+        "keychain_authorized": True,
+    }
+    assert "refresh_token" not in creds
+
+
+def test_claude_cache_strips_refresh_token_and_stays_private(monkeypatch, tmp_path):
+    import agentbar.usage as usage
+
+    cache = tmp_path / "claude_credentials.json"
+    monkeypatch.setattr(usage, "CLAUDE_CRED_CACHE", cache)
+    usage._cache_write_credentials({
+        "token": "access",
+        "refresh_token": "must-not-persist",
+        "expires_at": time.time() + 3600,
+        "keychain_authorized": True,
+    })
+    saved = json.loads(cache.read_text())
+    assert saved["token"] == "access"
+    assert "refresh_token" not in saved
+    assert os.stat(cache).st_mode & 0o777 == 0o600
+
+
+def test_claude_expired_cache_silently_syncs_new_keychain_token(monkeypatch, tmp_path):
+    import agentbar.usage as usage
+
+    cache = tmp_path / "claude_credentials.json"
+    cache.write_text(json.dumps({
+        "token": "stale-access-only",
+        "expires_at": time.time() - 60,
+        "keychain_authorized": True,
+    }))
+    monkeypatch.setattr(usage, "CLAUDE_CRED_CACHE", cache)
+    fresh_expiry_ms = int((time.time() + 3600) * 1000)
+    raw = json.dumps({"claudeAiOauth": {
+        "accessToken": "keychain-access",
+        "refreshToken": "keychain-refresh",
+        "expiresAt": fresh_expiry_ms,
+    }}).encode()
+    monkeypatch.setattr(usage, "_keychain_read", lambda interactive=False: raw)
+
+    creds = ClaudeUsageFetcher().load_credentials()
+    assert creds["token"] == "keychain-access"
+    assert creds["keychain_authorized"] is True
+    assert "refresh_token" not in creds
+    assert "refresh_token" not in json.loads(cache.read_text())
+
+
+def test_claude_expired_authorized_cache_does_not_ask_for_keychain_again(monkeypatch, tmp_path):
+    import agentbar.usage as usage
+
+    cache = tmp_path / "claude_credentials.json"
+    cache.write_text(json.dumps({
+        "token": "expired-access",
+        "expires_at": time.time() - 60,
+        "keychain_authorized": True,
+    }))
+    monkeypatch.setattr(usage, "CLAUDE_CRED_CACHE", cache)
+    keychain_reads = []
+    monkeypatch.setattr(
+        usage, "_keychain_read",
+        lambda interactive=False: keychain_reads.append(interactive) or None,
+    )
+
+    snap = ClaudeUsageFetcher().fetch()
+    assert "Claude Code 下次运行时会安全续期" in snap.error
+    assert "Keychain" not in snap.error
+    assert keychain_reads == [False]
 
 
 def test_codex_usage_parse_windows():
