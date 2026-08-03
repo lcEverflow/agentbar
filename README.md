@@ -100,7 +100,7 @@ uv run agentbar pause / resume / cancel <id> / log <id>
 
 订阅版 CLI 没有承诺稳定的公开额度查询 API。AgentBar 因此按以下顺序读取，任何一种拿不到都会如实降级：
 
-1. **usage API**（默认、120 秒刷新）：使用本机已有的 Claude OAuth / Codex 登录态读取其当前 usage 响应，显示窗口用量与重置时间。Claude Keychain 默认静默读取，绝不会在后台弹窗；首次在面板主动授权后，AgentBar 会用仅当前用户可读的 `0600` 缓存保存 refresh token，access token 过期时自动续期，不再反复请求 Keychain 权限。只有在 Claude 登录被撤销或 refresh token 失效后才需重新授权。
+1. **usage API**（默认、120 秒刷新）：使用本机已有的 Claude OAuth / Codex 登录态读取其当前 usage 响应，显示窗口用量与重置时间。Claude Keychain 默认静默读取，绝不会在后台弹窗；首次在面板主动授权后，AgentBar 只会把短期 access token 和授权状态保存到仅当前用户可读的 `0600` 缓存。refresh token 始终留在 Keychain，且只由官方 Claude Code 续期；AgentBar 会在后台无弹窗地同步新 access token，不会与 Claude Code 抢占或轮换 refresh token。
 2. **observed**：调度器自身观测的最近成功执行、真实限流和恢复时间；它会优先标记已确认的限流。
 3. **ccusage**（可选增强）：`npm i -g ccusage` 后补充 Claude 本地 5h 成本。
 4. 无任何可用数据时显示「未知」，并显示失败原因。**不会估算或编造百分比。**

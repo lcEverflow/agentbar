@@ -3,8 +3,8 @@
 Claude:  GET https://api.anthropic.com/api/oauth/usage
          凭据链: env CLAUDE_CODE_OAUTH_TOKEN → 本地缓存 ~/.agentbar/claude_credentials.json
                 → ~/.claude/.credentials.json
-                → macOS Keychain "Claude Code-credentials"（读到后缓存 access + refresh
-                  token，后续自动续期，避免反复弹窗）
+                → macOS Keychain "Claude Code-credentials"（只缓存短期 access token；
+                  refresh token 仍由 Claude Code 独占续期，避免竞态与反复弹窗）
          响应: {five_hour|seven_day|seven_day_opus|seven_day_sonnet:
                 {utilization: 0-100, resets_at: ISO8601}}
 
@@ -23,7 +23,6 @@ import base64
 import json
 import logging
 import os
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -112,28 +111,22 @@ def _jwt_payload(token: str) -> dict:
 # ================= Claude =================
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
-CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-# Claude Code 公开 OAuth client id（与本机 Claude Code CLI 使用的客户端一致）。
-CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-CLAUDE_REFRESH_SKEW_SECONDS = 60
 
-# 本地凭据缓存：Keychain 成功读到一次后写回这里（0600），包含
-# refresh token。后续 access token 过期时 AgentBar 自动续期，不再触碰
-# Keychain，从而避免 macOS 反复弹出"Python3 想访问 Claude Code-credentials"。
+# 本地凭据缓存：Keychain 成功读到一次后写回这里（0600）。只保存
+# 短期 access token 和“已授权”标记，故意不保存/使用 refresh token：
+# Claude Code 的 refresh token 会轮换，多进程独立续期可能导致登录态失效。
 CLAUDE_CRED_CACHE = Path.home() / ".agentbar" / "claude_credentials.json"
-_CLAUDE_REFRESH_LOCK = threading.Lock()
 
 
 def _cache_read_credentials() -> dict | None:
-    """读取本地凭据缓存；过期凭据也保留，供 refresh token 续期。"""
+    """读取本地凭据缓存；过期凭据也保留，用于记录授权状态。"""
     try:
         creds = json.loads(CLAUDE_CRED_CACHE.read_bytes())
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(creds, dict):
         return None
-    if not ((creds.get("token") or "").strip()
-            or (creds.get("refresh_token") or "").strip()):
+    if not (creds.get("token") or "").strip():
         return None
     return creds
 
@@ -143,7 +136,13 @@ def _cache_write_credentials(creds: dict) -> None:
     try:
         CLAUDE_CRED_CACHE.parent.mkdir(parents=True, exist_ok=True)
         tmp = CLAUDE_CRED_CACHE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(creds), encoding="utf-8")
+        # 允许列表会把旧版缓存里的 refresh_token 一并清理掉。
+        safe = {
+            key: creds.get(key)
+            for key in ("token", "expires_at", "plan", "scopes", "keychain_authorized")
+            if creds.get(key) is not None
+        }
+        tmp.write_text(json.dumps(safe), encoding="utf-8")
         os.chmod(tmp, 0o600)
         os.replace(tmp, CLAUDE_CRED_CACHE)
     except OSError:
@@ -184,92 +183,22 @@ def _parse_claude_credentials(raw: bytes) -> dict | None:
     expires_ms = oauth.get("expiresAt")
     return {
         "token": token,
-        "refresh_token": (oauth.get("refreshToken") or "").strip() or None,
         "expires_at": (expires_ms / 1000.0) if expires_ms else None,
         "plan": oauth.get("subscriptionType") or oauth.get("rateLimitTier"),
         "scopes": oauth.get("scopes"),
+        "keychain_authorized": True,
     }
 
 
 def _credentials_expired(creds: dict) -> bool:
-    """快过期也视为过期，避免在 usage 请求途中失效。"""
+    """凭据的 access token 是否已过期。"""
     exp = creds.get("expires_at")
     if not exp:
         return False
     try:
-        return float(exp) <= time.time() + CLAUDE_REFRESH_SKEW_SECONDS
+        return float(exp) <= time.time()
     except (TypeError, ValueError):
         return True
-
-
-def _refresh_claude_credentials(creds: dict) -> dict | None:
-    """用 refresh token 换取新 access token；失败时不泄露凭据内容。"""
-    refresh_token = (creds.get("refresh_token") or "").strip()
-    if not refresh_token:
-        return None
-    payload = json.dumps({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": CLAUDE_CODE_CLIENT_ID,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        CLAUDE_OAUTH_TOKEN_URL,
-        data=payload,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "agentbar/claude-oauth-refresh",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError,
-            json.JSONDecodeError) as exc:
-        log.warning("Claude OAuth 自动续期失败: %s", type(exc).__name__)
-        return None
-    token = (data.get("access_token") or "").strip()
-    expires_in = data.get("expires_in")
-    if not token or expires_in is None:
-        log.warning("Claude OAuth 自动续期响应缺少 token 或 expires_in")
-        return None
-    try:
-        expires_at = time.time() + float(expires_in)
-    except (TypeError, ValueError):
-        log.warning("Claude OAuth 自动续期响应的 expires_in 无效")
-        return None
-    updated = dict(creds)
-    updated.update({
-        "token": token,
-        # Anthropic 可能轮换 refresh token；未返回时沿用旧值。
-        "refresh_token": (data.get("refresh_token") or refresh_token).strip(),
-        "expires_at": expires_at,
-    })
-    if data.get("scope") is not None:
-        updated["scopes"] = data["scope"]
-    return updated
-
-
-def _ensure_fresh_credentials(creds: dict | None) -> dict | None:
-    """返回可用凭据；必要时只刷新一次并原子写回缓存。"""
-    if not creds:
-        return None
-    if not _credentials_expired(creds):
-        return creds
-    if not (creds.get("refresh_token") or "").strip():
-        return None
-    with _CLAUDE_REFRESH_LOCK:
-        # 其他请求可能已在等锁期间完成续期。
-        cached = _cache_read_credentials()
-        if cached and not _credentials_expired(cached):
-            return cached
-        # cached 若仍过期，必须使用调用方刚读到的凭据；它可能
-        # 来自 Claude CLI 刚轮换过的 Keychain，比旧缓存更新。
-        refreshed = _refresh_claude_credentials(creds)
-        if refreshed:
-            _cache_write_credentials(refreshed)
-        return refreshed
 
 
 class ClaudeUsageFetcher:
@@ -287,34 +216,29 @@ class ClaudeUsageFetcher:
             token = (os.environ.get(env_key) or "").strip()
             if token:
                 return {"token": token, "expires_at": None, "plan": None}
-        # 本地缓存优先：过期时用 refresh token 自动续期，不碰 Keychain。
+        # 本地缓存未过期时直接使用，完全不碰 Keychain。
         cached = _cache_read_credentials()
-        refreshable = cached if cached and cached.get("refresh_token") else None
-        fresh = _ensure_fresh_credentials(cached)
-        if fresh:
-            return fresh
+        if cached and not _credentials_expired(cached):
+            return cached
         cred_file = Path.home() / ".claude" / ".credentials.json"
         if cred_file.exists():
             try:
                 creds = _parse_claude_credentials(cred_file.read_bytes())
             except OSError:
                 creds = None
-            if creds and creds.get("refresh_token"):
-                refreshable = creds
-            fresh = _ensure_fresh_credentials(creds)
-            if fresh:
-                return fresh
+            if creds and not _credentials_expired(creds):
+                _cache_write_credentials(creds)
+                return creds
+        # access token 过期后只做静默同步（UIFail）。Claude Code 自己运行
+        # 时会按其内置锁与 Keychain 写回机制续期，AgentBar 不参与轮换。
         raw = _keychain_read(interactive=interactive)
         if raw:
             creds = _parse_claude_credentials(raw)
             if creds:
-                # 先落盘 refresh token：即使当下网络不能续期，下次也无需
-                # 再读 Keychain。
                 _cache_write_credentials(creds)
-                return _ensure_fresh_credentials(creds) or creds
-        # 有 refresh token 但当下网络续期失败时，返回过期凭据只为
-        # 让 fetch() 显示“自动续期重试”，不再误导用户反复授权 Keychain。
-        return refreshable
+                return creds
+        # 已经授权过的旧缓存保留为状态信号：不再误报“需要授权”。
+        return cached if cached and cached.get("keychain_authorized") else None
 
     def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
         creds = self.load_credentials(interactive=interactive)
@@ -322,13 +246,14 @@ class ClaudeUsageFetcher:
             return UsageSnapshot(
                 self.tool, source="oauth_api",
                 error=("未读到可用的 Claude 凭据（只需手动授权 Keychain 一次，"
-                       "后续由 AgentBar 自动续期）"),
+                       "后续静默同步）"),
             )
-        if creds.get("expires_at") and creds["expires_at"] < time.time():
-            if creds.get("refresh_token"):
+        if _credentials_expired(creds):
+            if creds.get("keychain_authorized"):
                 return UsageSnapshot(
                     self.tool, source="oauth_api",
-                    error="Claude OAuth 自动续期暂时失败，AgentBar 将后台重试",
+                    error=("Claude access token 已过期；Claude Code 下次运行时会安全续期，"
+                           "AgentBar 将静默同步"),
                 )
             return UsageSnapshot(
                 self.tool, source="oauth_api",
