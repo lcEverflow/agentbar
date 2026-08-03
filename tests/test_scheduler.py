@@ -83,6 +83,22 @@ def test_per_task_pause_resume(core, tmp_path):
     wait_for(lambda: _get(core, t.id)["state"] == "succeeded", desc="resumed")
 
 
+def test_snapshot_exposes_provider_setup_state_without_cookie(core, settings):
+    settings.providers["mytoken"].update({
+        "enabled": True,
+        "cookie": "SESSION=secret",
+        "unit": "credits",
+    })
+    providers = core.snapshot()["provider_config"]
+    assert providers["mytoken"] == {
+        "enabled": True,
+        "cookie_set": True,
+        "unit": "credits",
+    }
+    assert "cookie" not in providers["mytoken"]
+    assert providers["tokenverse"]["cookie_set"] is False
+
+
 def test_serial_fifo(settings, tmp_path):
     settings.max_parallel = 1
     settings.per_tool_limit = 1

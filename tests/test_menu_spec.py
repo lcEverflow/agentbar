@@ -93,8 +93,25 @@ def test_keychain_authorize_only_on_keychain_error():
 def test_core_actions_present():
     spec = build_menu_spec(_snap())
     actions = {n["action"] for n in spec if n["kind"] == "action"}
-    assert {"open_panel", "quick_add", "quit"} <= actions
+    assert {"open_panel", "quick_add", "provider_settings", "quit"} <= actions
     assert "open_web_panel" not in actions
+
+
+def test_unconfigured_corp_providers_stay_discoverable_in_menu():
+    spec = build_menu_spec(_snap(provider_config={
+        "mytoken": {"enabled": False, "cookie_set": False, "unit": "credits"},
+        "tokenverse": {"enabled": True, "cookie_set": False, "unit": "credits"},
+    }))
+    provider_rows = [
+        row for row in spec
+        if row["kind"] == "submenu"
+        and ("MyToken" in row["title"] or "Tokenverse" in row["title"])
+    ]
+    assert len(provider_rows) == 2
+    assert "未配置" in provider_rows[0]["title"]
+    assert "缺少 Cookie" in provider_rows[1]["title"]
+    for row in provider_rows:
+        assert any(child.get("action") == "provider_settings" for child in row["children"])
 
 
 def _mobile_children(spec):
@@ -221,6 +238,8 @@ def test_menu_shows_corp_provider_credits():
     rows = build_menu_spec(_corp_snapshot())
     titles = [r["title"] for r in rows]
     assert any("MyToken" in t and "credits" in t for t in titles)
+    mytoken = next(r for r in rows if r["kind"] == "submenu" and "MyToken" in r["title"])
+    assert any(child.get("action") == "provider_settings" for child in mytoken["children"])
 
 
 def test_title_provider_selectable():

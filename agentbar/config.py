@@ -20,6 +20,13 @@ DEFAULT_PROVIDERS: dict = {
     "mytoken": {"enabled": False, "cookie": "", "unit": "credits", "refresh_seconds": 300},
     "tokenverse": {"enabled": False, "cookie": "", "unit": "credits", "refresh_seconds": 300},
 }
+PROVIDER_HOSTS = {
+    "mytoken": "mytoken.corp.kuaishou.com",
+    "tokenverse": "tokenverse.corp.kuaishou.com",
+}
+PROVIDER_LOGIN_URLS = {
+    name: f"https://{host}/usage" for name, host in PROVIDER_HOSTS.items()
+}
 PROVIDER_UNITS = ("credits", "percent", "token")
 
 

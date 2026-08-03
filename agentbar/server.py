@@ -20,19 +20,19 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import __version__
 from .browser_cookies import CookieImportError, import_cookie_header
-from .config import DEFAULT_PROVIDERS, PROVIDER_UNITS, Settings, save_settings
+from .config import (
+    DEFAULT_PROVIDERS,
+    PROVIDER_HOSTS,
+    PROVIDER_UNITS,
+    Settings,
+    save_settings,
+)
 from .scheduler import Scheduler
 
 log = logging.getLogger("agentbar.server")
 
 MAX_BODY = 200_000
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
-PROVIDER_HOSTS = {
-    "mytoken": "mytoken.corp.kuaishou.com",
-    "tokenverse": "tokenverse.corp.kuaishou.com",
-}
-
-
 def _host_of(header: str) -> str:
     """Extract host part from a Host header ([::1]:8737 / 10.1.2.3:8737 / localhost)."""
     header = header or ""
@@ -412,7 +412,7 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                     self._json(404, {"ok": False,
                                      "error": "menu bar 未运行（headless 无此通道）"})
                     return
-                if action not in {"open_panel", "quick_add", "refresh_quota",
+                if action not in {"open_panel", "quick_add", "provider_settings", "refresh_quota",
                                   "tunnel_start", "tunnel_stop"}:
                     self._json(400, {"ok": False, "error": f"action 不在白名单: {action!r}"})
                     return

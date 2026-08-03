@@ -17,7 +17,7 @@ import time
 
 from . import __version__
 from .adapters.base import Outcome, get_registry
-from .config import Settings
+from .config import DEFAULT_PROVIDERS, Settings
 from .models import (
     FINISHED_STATES,
     PROFILES,
@@ -381,6 +381,14 @@ class Scheduler:
             status = "waiting"
         else:
             status = "idle"
+        provider_config = {}
+        for name in DEFAULT_PROVIDERS:
+            cfg = (self.settings.providers or {}).get(name) or {}
+            provider_config[name] = {
+                "enabled": bool(cfg.get("enabled")),
+                "cookie_set": bool(str(cfg.get("cookie") or "").strip()),
+                "unit": cfg.get("unit") or DEFAULT_PROVIDERS[name]["unit"],
+            }
         return {
             "version": __version__,
             "status": status,
@@ -397,6 +405,9 @@ class Scheduler:
                 )
             },
             "title_provider": self.settings.title_provider,
+            # 菜单只需要无敏感信息的配置摘要，用于展示“未配置/待刷新”入口。
+            # Cookie 永远不进入 snapshot、日志或前端状态转储。
+            "provider_config": provider_config,
             "cli_processes": self._cli_processes_snapshot(),
             "settings": {
                 "max_parallel": self.settings.max_parallel,

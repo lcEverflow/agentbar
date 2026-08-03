@@ -158,6 +158,7 @@ class AgentBarApp:
         self._menu = None
         self._timer = None
         self._panel = None  # 原生任务面板窗口（懒加载）
+        self._provider_panel = None  # MyToken / Tokenverse 原生设置窗口（懒加载）
         self._ring_key = None    # 双环图标缓存键（进度没变不重画，避免 2s 一次的无谓刷新）
         self._qr_window = None   # 手机访问二维码窗口（懒加载）
         self._qr_webview = None  # 二维码窗口里的 WKWebView（内容可切换 LAN/公网）
@@ -325,6 +326,8 @@ class AgentBarApp:
                 self._show_panel(False)
             elif action == "quick_add":
                 self._show_panel(True)
+            elif action == "provider_settings":
+                self._show_provider_settings()
             elif action == "refresh_quota":
                 self.core.quota.refresh_now()  # 异步：只置事件
             elif action == "authorize_keychain":
@@ -356,6 +359,18 @@ class AgentBarApp:
                 self.core, self.settings, self.server
             )
         self._panel.show_(focus_prompt)
+
+    def _show_provider_settings(self) -> None:
+        """原生内部额度设置：菜单里始终可发现，不再藏在 Web 面板。"""
+        if self._provider_panel is None:
+            from .provider_window import ProviderSettingsWindowController
+
+            self._provider_panel = (
+                ProviderSettingsWindowController.alloc().initWithCore_settings_(
+                    self.core, self.settings
+                )
+            )
+        self._provider_panel.show_(None)
 
     def _show_mobile_qr(self) -> None:
         """局域网扫码：http://<LAN IP>:<port>/m?token=…（手机与 Mac 同一 Wi-Fi）。"""

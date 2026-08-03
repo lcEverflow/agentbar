@@ -24,7 +24,7 @@ macOS 状态栏（Menu Bar）AI Agent 调度器 —— 让 Claude Code、Codex �
 | ---- | ---- |
 | 常驻 Menu Bar / 开机自启 | 原生 AppKit（NSStatusItem/NSMenu）+ `scripts/install-launch-agent.sh` |
 | 可操作的 Menu Bar | 每一行都可点（概览/任务/额度行点击即打开面板）；菜单只在展开时刷新（menuWillOpen）；所有动作毫秒级返回，绝不阻塞主线程；实时菜单状态导出 `menu-debug.json` 可核查 |
-| 原生任务面板窗口 | 菜单点击直接弹出 AppKit 窗口（accessory 进程激活自身窗口不受 macOS 26 协作激活限制）：添加任务（Prompt/工具/模型/强度/权限/目录选择器）、队列排优先级（⇧置顶/↑/↓）、取消/重试/暂停派发，进程内直连调度器不经浏览器；web 面板降为次要入口（`🌐 在浏览器中打开面板` / 手机远程） |
+| 原生任务面板窗口 | 菜单点击直接弹出 AppKit 窗口（accessory 进程激活自身窗口不受 macOS 26 协作激活限制）：添加任务（Prompt/工具/模型/强度/权限/目录选择器）、队列排优先级（⇧置顶/↑/↓）、取消/重试/暂停派发；底部「额度设置」可原生配置 MyToken / Tokenverse，不再依赖 Web 面板 |
 | 添加任务（Prompt+工具+目录） | 菜单栏快捷添加 / Web 面板 / `agentbar add` CLI |
 | 支持 Claude Code、Codex，可扩展 | Adapter 插件制，新 CLI ≈ 60 行代码 |
 | 串行 / 有限并行 | `max_parallel`（默认 1 串行）+ `per_tool_limit` |
@@ -180,7 +180,7 @@ agentbar.log   # 调度器日志
 | **MyToken** | `mytoken.corp.kuaishou.com` — `/api/auth/sso/user` → `/api/v1/billing/account` | corp SSO cookie + `kwaipilot-username` 头（自动带） |
 | **Tokenverse** | `tokenverse.corp.kuaishou.com` — `/api/coding-plan/status` + `/api/coding-plan/usage/summary` | corp SSO cookie |
 
-启用方式：打开 AgentBar 面板 → **内部额度配置**，可直接点“从浏览器导入 Cookie”读取本机 Chrome / Edge / Brave 登录态，也可手动粘贴浏览器 DevTools 里的整行 `Cookie`。保存后会立即重建 provider 并刷新额度，不需要手写 JSON 或重启。每个 provider 可独立配置展示单位（`credits`/`percent`/`token`）与刷新间隔。诚实原则不变：cookie 缺失或接口失败时如实显示错误，绝不编造额度。接口契约参考 [ylab/aiusagebar](https://git.corp.kuaishou.com/ylab/aiusagebar)。
+启用方式：点击菜单栏 AgentBar 图标 → **内部额度设置…**（或原生任务面板底部「额度设置」）。MyToken / Tokenverse 即使尚未配置也会以“未配置”状态出现在菜单中。点「浏览器登录」后 AgentBar 会像 AIUsageBar 一样启动一个临时 Chrome 会话；在其中完成企业 SSO 后，通过 Chrome 调试协议捕获 Cookie，并用真实额度接口校验，成功后自动保存、启用和刷新。原有「读取已有登录」与手动粘贴整行 `Cookie` 仍作为兜底。每个 provider 可独立配置展示单位（`credits`/`percent`/`token`）与刷新间隔；Web 面板中的 **内部额度配置** 仍作为备用入口。诚实原则不变：cookie 缺失或接口失败时如实显示错误，绝不编造额度。交互和接口契约参考 [ylab/aiusagebar](https://git.corp.kuaishou.com/ylab/aiusagebar)。
 
 ## 扩展新的 AI CLI
 

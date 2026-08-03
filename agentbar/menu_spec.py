@@ -161,9 +161,32 @@ def _quota_submenu(tool: str, qi: dict) -> dict:
         children.append(_action(f"⚠ {qi['error'][:70]}"))
     children.append(_sep())
     children.append(_action("↻ 立即刷新额度", "refresh_quota"))
+    if tool in ("mytoken", "tokenverse"):
+        children.append(_action(f"⚙ 配置 {_provider_name(tool)}…", "provider_settings"))
     if tool == "claude" and "Keychain" in (qi.get("error") or ""):
         children.append(_action("🔑 授权读取 Claude Keychain…", "authorize_keychain"))
     return _submenu(f"{dot} {_provider_name(tool)} · {_quota_compact(qi)}", children)
+
+
+def _provider_setup_submenu(tool: str, cfg: dict) -> dict:
+    enabled = bool(cfg.get("enabled"))
+    cookie_set = bool(cfg.get("cookie_set"))
+    if enabled and cookie_set:
+        state = "等待刷新"
+        detail = "已启用且 Cookie 已配置，正在等待额度接口返回。"
+    elif enabled:
+        state = "缺少 Cookie"
+        detail = "已启用，但尚未配置企业 SSO Cookie。"
+    elif cookie_set:
+        state = "未启用"
+        detail = "Cookie 已保存；启用后才会请求并显示额度。"
+    else:
+        state = "未配置"
+        detail = "点击配置，从本机浏览器导入企业 SSO 登录态。"
+    return _submenu(
+        f"⚪ {_provider_name(tool)} · {state}",
+        [_info(detail), _action(f"⚙ 配置 {_provider_name(tool)}…", "provider_settings")],
+    )
 
 
 def _mobile_submenu(t: dict) -> dict:
@@ -225,11 +248,20 @@ def build_menu_spec(snapshot: dict) -> list[dict]:
         if qi:
             rows.append(_quota_submenu(tool, qi))
             shown = True
+    # 未配置的内部 provider 也必须出现在真实菜单中，否则用户无从发现入口。
+    # 老测试/第三方调用未提供 provider_config 时保持历史输出不变。
+    provider_config = snapshot.get("provider_config")
+    if isinstance(provider_config, dict):
+        for tool in ("mytoken", "tokenverse"):
+            if tool not in quota:
+                rows.append(_provider_setup_submenu(tool, provider_config.get(tool) or {}))
+                shown = True
     if shown:
         rows.append(_sep())
 
     rows.append(_action("↗ 打开任务面板", "open_panel"))
     rows.append(_action("＋ 快速添加任务…", "quick_add"))
+    rows.append(_action("⚙ 内部额度设置…", "provider_settings"))
     rows.append(_mobile_submenu(snapshot.get("tunnel") or {}))
     rows.append(_sep())
     if snapshot.get("paused"):

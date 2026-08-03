@@ -1,6 +1,6 @@
 [project]
 name = "agentbar"
-version = "0.10.2"
+version = "0.10.3"
 description = "macOS menu bar scheduler for AI CLI agents (Claude Code, Codex, ...)"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,6 +12,8 @@ dependencies = [
     "pyobjc-framework-Security>=11.0; sys_platform == 'darwin'",
     "pyobjc-framework-webkit>=12.2.1",
     "qrcode>=8.2",
+    # 企业 SSO 原生配置：用真实 Chrome + CDP 捕获并验证 MyToken/Tokenverse Cookie。
+    "websocket-client>=1.8",
 ]
 
 [project.scripts]

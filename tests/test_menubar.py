@@ -77,6 +77,18 @@ def test_refresh_quota_dispatch_only_sets_event():
     assert app.core.quota.refreshed == 1
 
 
+def test_provider_settings_dispatch_opens_native_window(monkeypatch):
+    app = _app()
+    shown = []
+    monkeypatch.setattr(
+        AgentBarApp, "_show_provider_settings", lambda self: shown.append(True)
+    )
+    start = time.monotonic()
+    app._dispatch("provider_settings")
+    assert time.monotonic() - start < 0.05
+    assert shown == [True]
+
+
 def test_pause_resume_dispatch():
     app = _app()
     app._dispatch("pause_all")

@@ -260,6 +260,10 @@ def test_debug_dispatch_routes_to_hook(api):
     code, j = _call(srv, "/api/debug/dispatch", "POST", s.token,
                     {"action": "open_panel"})
     assert code == 202 and seen == ["open_panel"]
+    code, j = _call(srv, "/api/debug/dispatch", "POST", s.token,
+                    {"action": "provider_settings"})
+    assert code == 202 and j["action"] == "provider_settings"
+    assert seen[-1] == "provider_settings"
     # 白名单外的动作（quit 等）拒绝远程触发
     code, _ = _call(srv, "/api/debug/dispatch", "POST", s.token, {"action": "quit"})
     assert code == 400

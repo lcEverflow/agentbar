@@ -95,6 +95,7 @@ class PanelWindowController(NSObject):
         self._current_efforts = []
         self._transcript_windows = {}
         self._transcript_meta = {}
+        self._provider_settings_panel = None
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             2.0, self, "onTick:", None, True
         )
@@ -257,6 +258,11 @@ class PanelWindowController(NSObject):
         self.pause_btn = _button("Ⅱ 暂停派发", bx + 8, PAD + 26, 104, self, "onTogglePause:")
         self.pause_btn.setAutoresizingMask_(NSViewMaxYMargin)
         v.addSubview_(self.pause_btn)
+
+        provider_btn = _button("⚙ 额度设置", W - PAD - 234, PAD + 26, 118,
+                               self, "onProviderSettings:")
+        provider_btn.setAutoresizingMask_(NSViewMaxYMargin | 1)
+        v.addSubview_(provider_btn)
 
         self.transcript_btn = _button("📄 查看对话", W - PAD - 108, PAD + 26, 108,
                                       self, "onShowTranscript:")
@@ -478,6 +484,17 @@ class PanelWindowController(NSObject):
                 )
                 return
         self._open_transcript_window(t)
+
+    def onProviderSettings_(self, _sender):
+        if self._provider_settings_panel is None:
+            from .provider_window import ProviderSettingsWindowController
+
+            self._provider_settings_panel = (
+                ProviderSettingsWindowController.alloc().initWithCore_settings_(
+                    self.core, self.settings
+                )
+            )
+        self._provider_settings_panel.show_(None)
 
     @objc.python_method
     def _open_transcript_window(self, task_dict: dict):
