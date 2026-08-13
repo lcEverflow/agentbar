@@ -59,7 +59,11 @@ class TunnelManager:
     def status(self) -> dict:
         with self._lock:
             # 进程意外退出 → 降级为 error（reader 线程也会置，这里兜底）
-            if self._state == "up" and self._proc and self._proc.poll() is not None:
+            if (
+                self._state in ("starting", "up")
+                and self._proc
+                and self._proc.poll() is not None
+            ):
                 self._mark_down_locked("隧道进程已退出")
             return {"state": self._state, "url": self._url, "error": self._error,
                     "installed": self.binary() is not None}
@@ -127,7 +131,10 @@ class TunnelManager:
             # Also wake start() when stop() terminates a still-starting process.
             url_evt.set()
             with self._lock:
-                if self._proc is proc and self._state == "up":
+                # EOF can race with start() between accepting a URL and
+                # publishing state=up. Retire both phases atomically; otherwise
+                # an already-dead process can leave status() stuck at starting.
+                if self._proc is proc and self._state in ("starting", "up"):
                     self._mark_down_locked("隧道进程已退出")
 
         threading.Thread(target=_reader, name="agentbar-tunnel-io", daemon=True).start()
@@ -143,7 +150,11 @@ class TunnelManager:
             return False
 
         with self._lock:
-            if self._proc is not proc or self._state != "starting" or proc.poll() is not None:
+            if self._proc is not proc or self._state != "starting":
+                should_stop = True
+                host = None
+            elif proc.poll() is not None:
+                self._mark_down_locked("隧道进程已退出")
                 should_stop = True
                 host = None
             else:
