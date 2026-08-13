@@ -48,6 +48,15 @@ def test_installer_is_atomic_and_has_failure_rollback():
     assert "cat > \"$PLIST\"" not in installer
 
 
+def test_installer_braces_variables_before_unicode_punctuation():
+    installer = (SCRIPTS / "install-launch-agent.sh").read_text(encoding="utf-8")
+
+    # In a UTF-8 locale Bash can treat full-width punctuation adjacent to an
+    # unbraced expansion as part of the variable name under `set -u`.
+    assert "${STDERR_LOG}（权限 0600）" in installer
+    assert "$STDERR_LOG（" not in installer
+
+
 def test_dmg_build_uses_locked_dependencies_and_cleans_temporary_outputs():
     build = (SCRIPTS / "build-dmg.sh").read_text(encoding="utf-8")
     assert "uv.lock" in build
