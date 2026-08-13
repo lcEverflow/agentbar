@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import logging
+import threading
 import time
 
 import objc
@@ -35,6 +37,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
 )
 from Foundation import NSObject, NSTimer
+from PyObjCTools import AppHelper
 
 log = logging.getLogger("agentbar.panel")
 
@@ -95,6 +98,13 @@ class PanelWindowController(NSObject):
         self._current_efforts = []
         self._transcript_windows = {}
         self._transcript_meta = {}
+        # Transcript discovery/stat/parsing can touch large recursive session
+        # trees and multi-megabyte JSONL files. Keep one worker per task and let
+        # AppKit's main thread only apply an already-rendered result.
+        self._transcript_workers = {}
+        self._transcript_pending = set()
+        self._transcript_generation = {}
+        self._provider_settings_panel = None
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             2.0, self, "onTick:", None, True
         )
@@ -258,6 +268,11 @@ class PanelWindowController(NSObject):
         self.pause_btn.setAutoresizingMask_(NSViewMaxYMargin)
         v.addSubview_(self.pause_btn)
 
+        provider_btn = _button("⚙ 额度设置", W - PAD - 234, PAD + 26, 118,
+                               self, "onProviderSettings:")
+        provider_btn.setAutoresizingMask_(NSViewMaxYMargin | 1)
+        v.addSubview_(provider_btn)
+
         self.transcript_btn = _button("📄 查看对话", W - PAD - 108, PAD + 26, 108,
                                       self, "onShowTranscript:")
         self.transcript_btn.setAutoresizingMask_(NSViewMaxYMargin | 1)
@@ -403,6 +418,13 @@ class PanelWindowController(NSObject):
         except ValueError as e:
             self._alert("无法添加任务", str(e))
             return
+        except OSError:
+            log.exception("persist added task failed")
+            self._alert(
+                "无法添加任务",
+                "本地状态保存失败，任务未添加；请检查磁盘后重试。",
+            )
+            return
         self.prompt_view.setString_("")
         self.schedule_check.setState_(0)
         self.schedule_picker.setHidden_(True)
@@ -466,10 +488,20 @@ class PanelWindowController(NSObject):
                     with self.core._lock:
                         live = self.core._tasks.get(t["id"])
                         if live and not live.session_id:
+                            checkpoint = live.to_dict()
                             live.session_id = sid
-                            self.core._persist_locked()
+                            try:
+                                self.core._persist_locked()
+                            except Exception:
+                                self.core._restore_task_locked(live, checkpoint)
+                                raise
                 except Exception:
                     log.exception("persist recovered sid failed")
+                    self._alert(
+                        "无法保存会话记录",
+                        "本地状态文件写入失败，恢复结果未生效；请检查磁盘后重试。",
+                    )
+                    return
             else:
                 self._alert(
                     "无会话记录",
@@ -478,6 +510,17 @@ class PanelWindowController(NSObject):
                 )
                 return
         self._open_transcript_window(t)
+
+    def onProviderSettings_(self, _sender):
+        if self._provider_settings_panel is None:
+            from .provider_window import ProviderSettingsWindowController
+
+            self._provider_settings_panel = (
+                ProviderSettingsWindowController.alloc().initWithCore_settings_(
+                    self.core, self.settings
+                )
+            )
+        self._provider_settings_panel.show_(None)
 
     @objc.python_method
     def _open_transcript_window(self, task_dict: dict):
@@ -515,7 +558,16 @@ class PanelWindowController(NSObject):
         wkview = self._make_webview(NSMakeRect(PAD, PAD, 780 - 2 * PAD, 580 - 2 * PAD - 36))
         cv.addSubview_(wkview)
 
-        self._transcript_meta[tid] = {"tool": tool, "cwd": cwd, "sid": sid, "wkview": wkview}
+        generation = self._transcript_generation.get(tid, 0) + 1
+        self._transcript_generation[tid] = generation
+        self._transcript_meta[tid] = {
+            "tool": tool,
+            "cwd": cwd,
+            "sid": sid,
+            "wkview": wkview,
+            "_generation": generation,
+            "_identity": (tool, cwd, sid),
+        }
         self._transcript_windows[tid] = tw
         self._refresh_transcript_window(tid)
         tw.makeKeyAndOrderFront_(None)
@@ -524,8 +576,15 @@ class PanelWindowController(NSObject):
     def _make_webview(self, frame):
         """Create a WKWebView; fallback to NSTextView if WebKit is unavailable."""
         try:
-            from WebKit import WKWebView, WKWebViewConfiguration
+            from WebKit import WKWebView, WKWebViewConfiguration, WKWebsiteDataStore
             cfg = WKWebViewConfiguration.alloc().init()
+            # 对话页是纯静态本地 HTML：禁用 JS 并使用非持久化存储，
+            # 即使渲染内容异常也不能执行脚本或污染其他 WebView 会话。
+            try:
+                cfg.preferences().setJavaScriptEnabled_(False)
+                cfg.setWebsiteDataStore_(WKWebsiteDataStore.nonPersistentDataStore())
+            except Exception:
+                pass
             wk = WKWebView.alloc().initWithFrame_configuration_(frame, cfg)
             wk.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             return wk
@@ -556,40 +615,134 @@ class PanelWindowController(NSObject):
             pass
         if not sid:
             return
-
-        from .transcript import find_session_file, to_html, parse_transcript
-        path = find_session_file(tool, cwd, sid)
         wkview = meta.get("wkview")
         if not wkview:
             return
 
-        # Skip reload if file hasn't changed since last load — preserves scroll position
-        cur_mtime = path.stat().st_mtime if path else None
-        if (cur_mtime is not None
-                and cur_mtime == meta.get("_mtime")
-                and sid == meta.get("_loaded_sid")):
-            return
-        meta["_mtime"] = cur_mtime
-        meta["_loaded_sid"] = sid
+        identity = (tool, cwd, sid)
+        if identity != meta.get("_identity"):
+            generation = self._transcript_generation.get(tid, 0) + 1
+            self._transcript_generation[tid] = generation
+            meta["_generation"] = generation
+            meta["_identity"] = identity
+            meta.pop("_loaded_key", None)
+        generation = meta.get("_generation", 0)
 
+        # A timer tick while parsing merely requests one follow-up stat. This
+        # both coalesces rapid file appends and prevents concurrent full parses.
+        if tid in self._transcript_workers:
+            self._transcript_pending.add(tid)
+            return
+        # Avoid importing WebKit on every timer path. The view was constructed
+        # on the main thread already; capability detection is sufficient here.
+        rich = callable(getattr(wkview, "loadHTMLString_baseURL_", None))
+
+        self._transcript_workers[tid] = generation
+        self._transcript_pending.discard(tid)
+        worker = threading.Thread(
+            target=self._render_transcript_background,
+            args=(
+                tid,
+                generation,
+                identity,
+                meta.get("_loaded_key"),
+                rich,
+            ),
+            name=f"agentbar-transcript-{tid}",
+            daemon=True,
+        )
         try:
-            from WebKit import WKWebView
-            if isinstance(wkview, WKWebView):
-                if path:
-                    content = to_html(tool, path)
-                else:
-                    content = f"<p style='color:#888;padding:16px'>未找到会话文件<br>session_id: {sid}<br>工具: {tool}<br>目录: {cwd}</p>"
-                    content = f"<!DOCTYPE html><html><body style='font-family:-apple-system'>{content}</body></html>"
-                wkview.loadHTMLString_baseURL_(content, None)
-                return
+            worker.start()
         except Exception:
-            pass
-        # Fallback: NSTextView plain text
-        if path:
-            text = parse_transcript(tool, path)
-        else:
-            text = f"[未找到会话文件]\nsession_id: {sid}\n工具: {tool}"
-        wkview.setString_(text)
+            self._transcript_workers.pop(tid, None)
+            log.exception("failed to start transcript worker")
+
+    @objc.python_method
+    def _render_transcript_background(
+        self, tid, generation, identity, loaded_key, rich,
+    ):
+        """Discover and render a transcript without touching AppKit objects."""
+        tool, cwd, sid = identity
+        key = None
+        content = None
+        try:
+            from .transcript import find_session_file, parse_transcript, to_html
+
+            path = find_session_file(tool, cwd, sid)
+            if path:
+                stat_result = path.stat()
+                key = (
+                    sid,
+                    str(path),
+                    stat_result.st_mtime_ns,
+                    stat_result.st_size,
+                    rich,
+                )
+            else:
+                key = (sid, None, None, None, rich)
+            if key != loaded_key:
+                if path:
+                    content = to_html(tool, path) if rich else parse_transcript(tool, path)
+                elif rich:
+                    safe_sid = html.escape(str(sid))
+                    safe_tool = html.escape(str(tool))
+                    safe_cwd = html.escape(str(cwd))
+                    content = (
+                        "<!DOCTYPE html><html><head>"
+                        "<meta http-equiv='Content-Security-Policy' "
+                        "content=\"default-src 'none'; style-src 'unsafe-inline'\">"
+                        "</head><body style='font-family:-apple-system'>"
+                        "<p style='color:#888;padding:16px'>未找到会话文件<br>"
+                        f"session_id: {safe_sid}<br>工具: {safe_tool}<br>"
+                        f"目录: {safe_cwd}</p></body></html>"
+                    )
+                else:
+                    content = f"[未找到会话文件]\nsession_id: {sid}\n工具: {tool}"
+        except Exception:
+            log.exception("transcript rendering failed for task %s", tid)
+            # Keep the old successfully rendered document. The next timer tick
+            # may retry after a transient file replacement/read race.
+            key = None
+            content = None
+        AppHelper.callAfter(
+            self._finish_transcript_refresh,
+            tid,
+            generation,
+            identity,
+            key,
+            rich,
+            content,
+        )
+
+    @objc.python_method
+    def _finish_transcript_refresh(
+        self, tid, generation, identity, key, rich, content,
+    ):
+        """Apply one worker result on the AppKit main thread if still current."""
+        if self._transcript_workers.get(tid) == generation:
+            self._transcript_workers.pop(tid, None)
+        meta = self._transcript_meta.get(tid)
+        window = self._transcript_windows.get(tid)
+        current = bool(
+            meta
+            and window
+            and window.isVisible()
+            and meta.get("_generation") == generation
+            and meta.get("_identity") == identity
+        )
+        if current and key is not None and content is not None:
+            wkview = meta.get("wkview")
+            if wkview:
+                if rich:
+                    wkview.loadHTMLString_baseURL_(content, None)
+                else:
+                    wkview.setString_(content)
+                meta["_loaded_key"] = key
+
+        pending = tid in self._transcript_pending
+        self._transcript_pending.discard(tid)
+        if pending and meta and window and window.isVisible():
+            self._refresh_transcript_window(tid)
 
     def onCopyResumeCmd_(self, _sender):
         try:
@@ -611,7 +764,15 @@ class PanelWindowController(NSObject):
         tid = self._selected_id()
         if not tid:
             return
-        ok, msg = self.core.act(tid, action)
+        try:
+            ok, msg = self.core.act(tid, action)
+        except OSError:
+            log.exception("persist task action failed")
+            self._alert(
+                "操作失败",
+                "本地状态保存失败，操作未生效；请检查磁盘后重试。",
+            )
+            return
         if not ok:
             self._alert("操作失败", msg)
         self.refresh()
@@ -632,10 +793,18 @@ class PanelWindowController(NSObject):
         self._act_selected("retry")
 
     def onTogglePause_(self, _s):
-        if self.core.paused:
-            self.core.resume_all()
-        else:
-            self.core.pause_all()
+        try:
+            if self.core.paused:
+                self.core.resume_all()
+            else:
+                self.core.pause_all()
+        except OSError:
+            log.exception("persist pause toggle failed")
+            self._alert(
+                "操作失败",
+                "本地状态保存失败，暂停状态未更改；请检查磁盘后重试。",
+            )
+            return
         self.refresh()
 
     @objc.python_method

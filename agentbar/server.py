@@ -1,7 +1,7 @@
 """Localhost HTTP API + task manager web UI (+ optional LAN access for mobile).
 
 安全：默认绑 127.0.0.1；lan_access=true 时绑 0.0.0.0 供同局域网手机访问。
-所有 /api（除 /api/ping）要求 token（Header 或 query）。Host 头校验只放行
+所有 /api（除 /api/ping）要求 Header token。Host 头校验只放行
 IP 字面量（DNS rebinding 必须借助域名，放行裸 IP 不破坏该防御）。
 token 存于 state 目录 config.json（0600）。
 """
@@ -12,33 +12,120 @@ import hmac
 import ipaddress
 import json
 import logging
+import re
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import __version__
 from .browser_cookies import CookieImportError, import_cookie_header
-from .config import DEFAULT_PROVIDERS, PROVIDER_UNITS, Settings, save_settings
+from .config import (
+    DEFAULT_QUOTA_SOURCES,
+    DEFAULT_PROVIDERS,
+    PROVIDER_HOSTS,
+    PROVIDER_UNITS,
+    Settings,
+    save_settings,
+)
 from .scheduler import Scheduler
 
 log = logging.getLogger("agentbar.server")
 
 MAX_BODY = 200_000
-ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
-PROVIDER_HOSTS = {
-    "mytoken": "mytoken.corp.kuaishou.com",
-    "tokenverse": "tokenverse.corp.kuaishou.com",
+REQUEST_IO_TIMEOUT_SECONDS = 15
+HANDLER_DRAIN_SECONDS = 5
+ALLOWED_HOSTS = {"127.0.0.1", "::1", "localhost"}
+_PROXY_HEADERS = {
+    "forwarded",
+    "via",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "true-client-ip",
 }
+_HTML_CSP = (
+    "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+    "form-action 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+    "connect-src 'self'; img-src 'self' data:"
+)
+
+
+class _BodyError(ValueError):
+    """A safe client-facing request-body error with an explicit HTTP status."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class _AdmissionClosed(RuntimeError):
+    """Raised when a request reaches its commit point during server shutdown."""
+
+
+class _RequestAdmission:
+    """Close mutation admission instantly, then drain accepted handlers boundedly."""
+
+    def __init__(self) -> None:
+        self.stopping = threading.Event()
+        self._condition = threading.Condition()
+        self._active_handlers = 0
+
+    def enter_handler(self) -> bool:
+        with self._condition:
+            if self.stopping.is_set():
+                return False
+            self._active_handlers += 1
+            return True
+
+    def leave_handler(self) -> None:
+        with self._condition:
+            self._active_handlers -= 1
+            if self._active_handlers == 0:
+                self._condition.notify_all()
+
+    def close(self) -> None:
+        # Event.set() does not wait for a long-running handler. Every mutation
+        # checks this predicate again immediately before touching core/settings.
+        self.stopping.set()
+
+    def require_open(self) -> None:
+        if self.stopping.is_set():
+            raise _AdmissionClosed("HTTP server is stopping")
+
+    def wait_for_handlers(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._active_handlers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
 
 
 def _host_of(header: str) -> str:
     """Extract host part from a Host header ([::1]:8737 / 10.1.2.3:8737 / localhost)."""
-    header = header or ""
+    header = (header or "").strip()
+    if not header or any(char.isspace() for char in header):
+        return ""
     if header.startswith("["):
-        return header[1:].split("]")[0].lower()
-    return header.split(":")[0].lower()
+        end = header.find("]")
+        if end < 0:
+            return ""
+        suffix = header[end + 1:]
+        if suffix and not (suffix.startswith(":") and suffix[1:].isdigit()):
+            return ""
+        return header[1:end].lower()
+    if header.count(":") > 1:  # IPv6 Host 必须使用 [addr]:port
+        return ""
+    host, sep, port = header.partition(":")
+    if sep and not port.isdigit():
+        return ""
+    return host.lower()
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -67,10 +154,15 @@ def _cookie_preview(cookie: str) -> str:
         return ""
     names = []
     for part in cookie.split(";"):
-        name = part.strip().split("=", 1)[0].strip()
-        if name:
+        raw = part.strip()
+        if "=" not in raw:
+            continue
+        name = raw.split("=", 1)[0].strip()
+        # Never echo arbitrary user input. Only cookie-name tokens are safe to
+        # expose; a pasted JWT/Bearer without '=' must remain completely masked.
+        if re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}", name):
             names.append(name)
-    shown = ", ".join(names[:4])
+    shown = ", ".join(names[:4]) or "已配置"
     return shown + (" ..." if len(names) > 4 else "")
 
 
@@ -90,35 +182,162 @@ def _provider_config_payload(settings: Settings) -> dict:
     return {
         "ok": True,
         "providers": providers,
+        "quota_sources": {
+            name: {
+                "enabled": bool(((settings.quota_sources or {}).get(name) or {}).get("enabled")),
+                "model": str(((settings.quota_sources or {}).get(name) or {}).get("model") or ""),
+                "key_set": bool(str(
+                    ((settings.quota_sources or {}).get(name) or {}).get("access_token") or ""
+                ).strip()),
+                "account_id_set": bool(str(
+                    ((settings.quota_sources or {}).get(name) or {}).get("account_id") or ""
+                ).strip()),
+            }
+            for name in DEFAULT_QUOTA_SOURCES
+        },
+        "usage_auto_refresh": bool(settings.usage_auto_refresh),
         "title_provider": settings.title_provider,
     }
 
 
-def _apply_provider_settings(settings: Settings, payload: dict) -> None:
-    providers = payload.get("providers") or {}
-    merged = json.loads(json.dumps(settings.providers or DEFAULT_PROVIDERS))
-    for name, defaults in DEFAULT_PROVIDERS.items():
-        incoming = providers.get(name)
-        if not isinstance(incoming, dict):
-            continue
-        cfg = merged.setdefault(name, dict(defaults))
-        if "enabled" in incoming:
-            cfg["enabled"] = bool(incoming.get("enabled"))
-        if incoming.get("unit") in PROVIDER_UNITS:
-            cfg["unit"] = incoming["unit"]
-        if "refresh_seconds" in incoming:
-            try:
-                cfg["refresh_seconds"] = max(60, int(incoming.get("refresh_seconds") or 300))
-            except (TypeError, ValueError):
-                cfg["refresh_seconds"] = defaults["refresh_seconds"]
-        if "cookie" in incoming:
-            # Missing cookie keeps the existing secret; explicit empty string clears it.
-            cfg["cookie"] = str(incoming.get("cookie") or "").strip()
-    title = payload.get("title_provider")
-    if title in {"claude", "codex", *DEFAULT_PROVIDERS.keys()}:
-        settings.title_provider = title
-    settings.providers = merged
-    save_settings(settings)
+def _apply_provider_settings(
+    settings: Settings,
+    payload: dict,
+    before_commit=None,
+) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("配置请求必须是 JSON object")
+    with settings._lock:
+        providers = payload.get("providers", {})
+        if not isinstance(providers, dict):
+            raise ValueError("providers 必须是 JSON object")
+        merged = json.loads(json.dumps(settings.providers or DEFAULT_PROVIDERS))
+        for name, defaults in DEFAULT_PROVIDERS.items():
+            incoming = providers.get(name)
+            if incoming is None:
+                continue
+            if not isinstance(incoming, dict):
+                raise ValueError(f"providers.{name} 必须是 JSON object")
+            cfg = merged.setdefault(name, dict(defaults))
+            if "enabled" in incoming:
+                cfg["enabled"] = _clean_bool_field(
+                    incoming.get("enabled"), f"providers.{name}.enabled",
+                )
+            if "unit" in incoming:
+                unit = incoming.get("unit")
+                if not isinstance(unit, str) or unit not in PROVIDER_UNITS:
+                    raise ValueError(
+                        f"providers.{name}.unit 必须是 "
+                        f"{', '.join(PROVIDER_UNITS)} 之一"
+                    )
+                cfg["unit"] = unit
+            if "refresh_seconds" in incoming:
+                seconds = incoming.get("refresh_seconds")
+                if isinstance(seconds, bool) or not isinstance(seconds, int):
+                    raise ValueError(
+                        f"providers.{name}.refresh_seconds 必须是整数"
+                    )
+                cfg["refresh_seconds"] = min(86_400, max(60, seconds))
+            if "cookie" in incoming:
+                # Missing cookie keeps the existing secret; explicit empty string clears it.
+                cfg["cookie"] = _clean_credential_field(
+                    incoming.get("cookie"), "Cookie", 65_536,
+                )
+
+        next_title = settings.title_provider
+        if "title_provider" in payload:
+            title = payload.get("title_provider")
+            if not isinstance(title, str) or title not in {
+                "claude", "codex", *DEFAULT_PROVIDERS.keys(),
+            }:
+                raise ValueError("title_provider 无效")
+            next_title = title
+        source_payload = payload.get("quota_sources", {})
+        if not isinstance(source_payload, dict):
+            raise ValueError("quota_sources 必须是 JSON object")
+        sources = json.loads(json.dumps(settings.quota_sources or DEFAULT_QUOTA_SOURCES))
+        for name, defaults in DEFAULT_QUOTA_SOURCES.items():
+            incoming = source_payload.get(name)
+            if incoming is None:
+                continue
+            if not isinstance(incoming, dict):
+                raise ValueError(f"quota_sources.{name} 必须是 JSON object")
+            cfg = sources.setdefault(name, dict(defaults))
+            cfg.pop("api_key", None)  # 旧字段只读迁移，永不再落盘。
+            if "enabled" in incoming:
+                cfg["enabled"] = _clean_bool_field(
+                    incoming.get("enabled"), f"quota_sources.{name}.enabled",
+                )
+            if "model" in incoming:
+                cfg["model"] = _clean_credential_field(incoming.get("model"), "模型", 160)
+            token_submitted = "access_token" in incoming or "api_key" in incoming
+            if token_submitted:
+                # access_token 是唯一正式字段；api_key 仅接受旧 Web 客户端迁移。
+                raw_token = (
+                    incoming.get("access_token")
+                    if "access_token" in incoming
+                    else incoming.get("api_key")
+                )
+                cfg["access_token"] = _clean_credential_field(
+                    raw_token, "OAuth Access Token", 16_384,
+                )
+            if "account_id" in incoming:
+                cfg["account_id"] = _clean_credential_field(
+                    incoming.get("account_id"), "Account ID", 256,
+                )
+            if token_submitted and not cfg.get("access_token"):
+                # 显式清空凭据时同时停用，避免留下会持续报错的半配置。
+                if incoming.get("enabled") is True:
+                    raise ValueError(f"{name} 启用前必须输入 OAuth Access Token")
+                cfg["enabled"] = False
+            if cfg.get("enabled") and not str(cfg.get("access_token") or "").strip():
+                raise ValueError(f"{name} 启用前必须输入 OAuth Access Token")
+        next_auto_refresh = settings.usage_auto_refresh
+        if "usage_auto_refresh" in payload:
+            next_auto_refresh = _clean_bool_field(
+                payload.get("usage_auto_refresh"), "usage_auto_refresh",
+            )
+
+        # 保存失败时恢复旧内存状态，避免 API 回报失败却部分生效。
+        old = (
+            settings.title_provider,
+            settings.providers,
+            settings.quota_sources,
+            settings.usage_auto_refresh,
+        )
+        if before_commit is not None:
+            before_commit()
+        settings.title_provider = next_title
+        settings.providers = merged
+        settings.quota_sources = sources
+        settings.usage_auto_refresh = next_auto_refresh
+        try:
+            save_settings(settings)
+        except Exception:
+            (
+                settings.title_provider,
+                settings.providers,
+                settings.quota_sources,
+                settings.usage_auto_refresh,
+            ) = old
+            raise
+
+
+def _clean_credential_field(value, label: str, max_len: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label}必须是字符串")
+    value = value.strip()
+    if len(value) > max_len:
+        raise ValueError(f"{label} 过长")
+    if any(char in value for char in "\r\n\x00"):
+        raise ValueError(f"{label} 不能包含换行或 NUL")
+    return value
+
+
+def _clean_bool_field(value, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} 必须是 boolean")
+    return value
 
 
 class ApiServer:
@@ -129,15 +348,29 @@ class ApiServer:
         self.hooks: dict = {"dispatch": None}
         # 动态 Host 白名单（公网隧道域名启动后注册进来；其余域名一律 403）
         self.extra_hosts: set[str] = set()
-        handler = _make_handler(core, settings, self.hooks, self.extra_hosts)
+        self._admission = _RequestAdmission()
+        handler = _make_handler(
+            core, settings, self.hooks, self.extra_hosts, self._admission
+        )
         bind = "0.0.0.0" if settings.lan_access else "127.0.0.1"
         self.httpd = ThreadingHTTPServer((bind, settings.port), handler)
+        # We provide our own bounded drain. ThreadingMixIn's default unbounded
+        # join can hang SIGTERM behind a slow Keychain/browser-cookie import.
+        # Lingering daemon handlers cannot commit after admission closes.
         self.httpd.daemon_threads = True
+        self.httpd.block_on_close = False
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
+        self._started = False
+        self._stopped = False
 
     @property
     def port(self) -> int:
         return self.httpd.server_address[1]
+
+    @property
+    def stopping(self) -> bool:
+        return self._admission.stopping.is_set()
 
     def url(self, with_token: bool = False, **query: str) -> str:
         """Return a local panel URL, optionally carrying an authenticated UI intent.
@@ -148,9 +381,10 @@ class ApiServer:
         """
         base = f"http://127.0.0.1:{self.port}/"
         params = {key: str(value) for key, value in query.items() if value is not None}
-        if with_token:
-            params["token"] = self.settings.token
-        return base + (f"?{urlencode(params)}" if params else "")
+        query_string = f"?{urlencode(params)}" if params else ""
+        # Fragment 不会进入 HTTP request line / proxy log / Referer。
+        fragment = f"#{urlencode({'token': self.settings.token})}" if with_token else ""
+        return base + query_string + fragment
 
     def allow_host(self, hostname: str) -> None:
         self.extra_hosts.add(hostname.lower())
@@ -165,32 +399,92 @@ class ApiServer:
         ip = lan_ip()
         if not ip:
             return None
-        return f"http://{ip}:{self.port}/m?token={self.settings.token}"
+        return f"http://{ip}:{self.port}/m#{urlencode({'token': self.settings.token})}"
 
     def start(self) -> None:
-        self._thread = threading.Thread(
-            target=self.httpd.serve_forever, name="agentbar-http", daemon=True
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._started or self._stopped:
+                return
+            self._thread = threading.Thread(
+                target=self.httpd.serve_forever, name="agentbar-http", daemon=True
+            )
+            self._thread.start()
+            self._started = True
         log.info("api server on %s", self.url())
 
     def stop(self) -> None:
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        # Hold the lifecycle lock through the drain so concurrent stop callers do
+        # not return before the owner has finished waiting for accepted handlers.
+        with self._lifecycle_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            # Linearization point: long-running accepted requests may finish
+            # their read/import work, but every commit path rejects afterwards.
+            self._admission.close()
+            thread = self._thread
+            if self._started:
+                self.httpd.shutdown()
+            # server_close is sufficient before start (shutdown would deadlock).
+            self.httpd.server_close()
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    log.warning("HTTP server thread did not stop within 5s")
+            if not self._admission.wait_for_handlers(HANDLER_DRAIN_SECONDS):
+                log.warning(
+                    "HTTP handlers did not drain within %ss; late mutations remain rejected",
+                    HANDLER_DRAIN_SECONDS,
+                )
 
 
 def _load_web(name: str) -> str:
     return resources.files("agentbar").joinpath(f"web/{name}").read_text("utf-8")
 
 
-def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None,
-                  extra_hosts: set | None = None):
+def _make_handler(
+    core: Scheduler,
+    settings: Settings,
+    hooks: dict | None = None,
+    extra_hosts: set | None = None,
+    admission: _RequestAdmission | None = None,
+):
     hooks = hooks if hooks is not None else {}
     extra_hosts = extra_hosts if extra_hosts is not None else set()
+    admission = admission if admission is not None else _RequestAdmission()
     class Handler(BaseHTTPRequestHandler):
         server_version = f"AgentBar/{__version__}"
+        sys_version = ""
 
         # ---------- plumbing ----------
+
+        def setup(self) -> None:
+            self._admission_entered = False
+            super().setup()
+            self._admission_entered = admission.enter_handler()
+            # Bound slow header/body clients too. In-process work is governed by
+            # the admission predicate and our separate bounded handler drain.
+            self.connection.settimeout(REQUEST_IO_TIMEOUT_SECONDS)
+
+        def finish(self) -> None:
+            try:
+                super().finish()
+            finally:
+                if self._admission_entered:
+                    self._admission_entered = False
+                    admission.leave_handler()
+
+        def _reject_if_stopping(self) -> bool:
+            if not self._admission_entered or admission.stopping.is_set():
+                try:
+                    self._json(503, {
+                        "ok": False,
+                        "error": "AgentBar 正在退出，拒绝新的操作",
+                    })
+                except OSError:
+                    pass
+                return True
+            return False
 
         def log_message(self, fmt, *args):  # 安静，不刷 stderr
             log.debug("http: " + fmt, *args)
@@ -201,6 +495,7 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -209,8 +504,18 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Security-Policy", _HTML_CSP)
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
+
+        def _security_headers(self) -> None:
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
 
         def _host_ok(self) -> bool:
             host = _host_of(self.headers.get("Host"))
@@ -221,24 +526,77 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             # 公网隧道域名走 extra_hosts 动态注册。
             return settings.lan_access and _is_ip_literal(host)
 
-        def _authed(self, query: dict) -> bool:
-            token = self.headers.get("X-Agentbar-Token") or (
-                query.get("token", [""])[0]
-            )
+        def _authed(self, _query: dict) -> bool:
+            # Query token 会泄漏到访问日志/历史/Referer，只接受请求头。
+            token = self.headers.get("X-Agentbar-Token") or ""
             return bool(token) and hmac.compare_digest(token, settings.token)
 
         def _body(self) -> dict:
-            n = int(self.headers.get("Content-Length") or 0)
-            if n <= 0 or n > MAX_BODY:
-                return {}
             try:
-                return json.loads(self.rfile.read(n).decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                n = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                raise _BodyError(400, "Content-Length 无效")
+            if n < 0:
+                raise _BodyError(400, "Content-Length 无效")
+            if n == 0:
                 return {}
+            if n > MAX_BODY:
+                # Consume one bounded body window before answering. Returning
+                # immediately can close the socket while a normal client is
+                # still sending a just-over-limit payload, turning the useful
+                # 413 into a platform-dependent connection reset. Never drain
+                # an attacker-declared unbounded length; socket timeout still
+                # caps slow senders.
+                try:
+                    self.rfile.read(min(n, MAX_BODY + 1))
+                except OSError:
+                    pass
+                raise _BodyError(413, f"请求体过大（上限 {MAX_BODY} 字节）")
+            try:
+                value = json.loads(self.rfile.read(n).decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                raise _BodyError(400, "请求体必须是合法 JSON object")
+            if not isinstance(value, dict):
+                raise _BodyError(400, "请求体必须是 JSON object")
+            return value
+
+        def _persistence_unavailable(self, operation: str) -> None:
+            # Never echo exception details: filesystem paths or secret-bearing
+            # payload fragments may be present in lower-layer errors.
+            log.exception("%s persistence failed", operation)
+            self._json(503, {
+                "ok": False,
+                "error": "本地状态保存失败，操作未生效；请检查磁盘后重试",
+            })
+
+        def _trusted_local(self) -> bool:
+            """Only a direct local request may touch credentials or local UI hooks.
+
+            Cloudflared and other reverse proxies connect from 127.0.0.1 too, so
+            peer IP alone is not a trust boundary. Require a loopback Host and
+            reject all common proxy provenance headers as well.
+            """
+            try:
+                peer_loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+            except (ValueError, IndexError, TypeError):
+                return False
+            if not peer_loopback or _host_of(self.headers.get("Host")) not in ALLOWED_HOSTS:
+                return False
+            for name in self.headers.keys():
+                lowered = name.lower()
+                if (
+                    lowered in _PROXY_HEADERS
+                    or lowered.startswith("cf-")
+                    or lowered.startswith("x-forwarded-")
+                ):
+                    return False
+            return True
 
         # ---------- routing ----------
 
         def do_GET(self):
+            if self._reject_if_stopping():
+                return
             if not self._host_ok():
                 self._json(403, {"ok": False, "error": "bad host"})
                 return
@@ -275,12 +633,32 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                                  "allow_full_profile": settings.allow_full_profile})
                 return
             if path == "/api/provider-config":
+                if not self._trusted_local():
+                    self._json(403, {
+                        "ok": False,
+                        "error": "额度与凭据配置只能在本机 AgentBar 面板中查看",
+                    })
+                    return
                 self._json(200, _provider_config_payload(settings))
                 return
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"] and parts[4] == "log":
-                tail = min(int(q.get("tail_bytes", ["30000"])[0]), 200_000)
-                text = core.store.read_log_tail(parts[3], tail)
+                task_id = parts[3]
+                with core._lock:
+                    task_exists = task_id in core._tasks
+                if not task_exists:
+                    self._json(404, {"ok": False, "error": "任务不存在"})
+                    return
+                try:
+                    tail = int(q.get("tail_bytes", ["30000"])[0])
+                except (TypeError, ValueError):
+                    tail = 30_000
+                tail = min(max(0, tail), 200_000)
+                try:
+                    text = core.store.read_log_tail(task_id, tail)
+                except ValueError:
+                    self._json(400, {"ok": False, "error": "任务 ID 无效"})
+                    return
                 self._json(200, {"ok": True, "log": text})
                 return
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"] and parts[4] == "transcript":
@@ -300,8 +678,21 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                     if sid:
                         with core._lock:
                             if not t.session_id:
+                                try:
+                                    admission.require_open()
+                                except _AdmissionClosed:
+                                    self._reject_if_stopping()
+                                    return
+                                checkpoint = t.to_dict()
                                 t.session_id = sid
-                                core._persist_locked()
+                                try:
+                                    core._persist_locked()
+                                except OSError:
+                                    core._restore_task_locked(t, checkpoint)
+                                    self._persistence_unavailable(
+                                        "recovered transcript session"
+                                    )
+                                    return
                 if not t.session_id:
                     self._json(200, {"ok": True, "transcript": "", "message": "该任务尚无会话 ID"})
                     return
@@ -317,6 +708,8 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             self._json(404, {"ok": False, "error": "not found"})
 
         def do_POST(self):
+            if self._reject_if_stopping():
+                return
             if not self._host_ok():
                 self._json(403, {"ok": False, "error": "bad host"})
                 return
@@ -326,10 +719,26 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             if not self._authed(q):
                 self._json(401, {"ok": False, "error": "unauthorized"})
                 return
-            body = self._body()
+            # Reject secret/UI-local routes before reading their request body.
+            # A proxied browser must never upload a credential to Cloudflare or
+            # a LAN hop only to receive a 403 after the bytes have been consumed.
+            local_only = {
+                "/api/provider-config",
+                "/api/provider-config/import-cookie",
+                "/api/debug/dispatch",
+            }
+            if path in local_only and not self._trusted_local():
+                self._json(403, {"ok": False, "error": "该操作仅允许本机直连"})
+                return
+            try:
+                body = self._body()
+            except _BodyError as e:
+                self._json(e.status, {"ok": False, "error": str(e)})
+                return
 
             if path == "/api/tasks":
                 try:
+                    admission.require_open()
                     t = core.add_task(
                         prompt=body.get("prompt", ""),
                         tool=body.get("tool", "claude"),
@@ -339,38 +748,95 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                         model=body.get("model"),
                         effort=body.get("effort"),
                         scheduled_at=body.get("scheduled_at"),
+                        before_commit=admission.require_open,
                     )
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
                 except ValueError as e:
                     self._json(400, {"ok": False, "error": str(e)})
+                    return
+                except OSError:
+                    self._persistence_unavailable("add task")
                     return
                 self._json(200, {"ok": True, "task": t.to_dict()})
                 return
             if path == "/api/pause-all":
-                core.pause_all()
+                try:
+                    admission.require_open()
+                    core.pause_all(before_commit=admission.require_open)
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
+                except ValueError as e:
+                    self._json(400, {"ok": False, "error": str(e)})
+                    return
+                except OSError:
+                    self._persistence_unavailable("pause all")
+                    return
                 self._json(200, {"ok": True})
                 return
             if path == "/api/resume-all":
-                core.resume_all()
+                try:
+                    admission.require_open()
+                    core.resume_all(before_commit=admission.require_open)
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
+                except ValueError as e:
+                    self._json(400, {"ok": False, "error": str(e)})
+                    return
+                except OSError:
+                    self._persistence_unavailable("resume all")
+                    return
                 self._json(200, {"ok": True})
                 return
             if path == "/api/quota/refresh":
-                core.quota.refresh_now()
-                self._json(202, {"ok": True, "message": "额度刷新已触发"})
-                return
-            if path == "/api/quota/authorize-claude":
-                # 仅由用户在本机面板主动调用，后台刷新不会触发 Keychain 弹窗。
-                ok = core.quota.authorize_claude_keychain()
-                self._json(200 if ok else 400, {
-                    "ok": ok,
-                    "message": "Claude Keychain 已授权并刷新" if ok else "未取得 Claude Keychain 授权",
+                tool = str(body.get("tool") or "").strip()
+                if not tool:
+                    self._json(400, {
+                        "ok": False,
+                        "error": "必须指定一个已启用的额度来源",
+                    })
+                    return
+                if tool not in core.quota.provider_tools():
+                    self._json(400, {"ok": False, "error": f"未启用的额度来源: {tool!r}"})
+                    return
+                try:
+                    admission.require_open()
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
+                core.quota.refresh_now(tool)
+                self._json(202, {
+                    "ok": True,
+                    "message": f"{tool} 额度刷新已触发",
                 })
                 return
             if path == "/api/provider-config":
+                if not self._trusted_local():
+                    self._json(403, {
+                        "ok": False,
+                        "error": "额度与凭据配置只能在本机 AgentBar 面板中保存",
+                    })
+                    return
                 try:
-                    _apply_provider_settings(settings, body)
+                    _apply_provider_settings(
+                        settings, body, before_commit=admission.require_open,
+                    )
                     core.quota.reload_fetchers()
-                except Exception as e:
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
+                except ValueError as e:
                     self._json(400, {"ok": False, "error": str(e)})
+                    return
+                except OSError:
+                    self._persistence_unavailable("provider config")
+                    return
+                except Exception:
+                    log.exception("provider config save failed")
+                    self._json(500, {"ok": False, "error": "配置保存失败"})
                     return
                 self._json(200, {
                     **_provider_config_payload(settings),
@@ -378,6 +844,9 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 })
                 return
             if path == "/api/provider-config/import-cookie":
+                if not self._trusted_local():
+                    self._json(403, {"ok": False, "error": "Cookie 导入仅允许本机直连"})
+                    return
                 provider = str(body.get("provider") or "")
                 host = PROVIDER_HOSTS.get(provider)
                 if not host:
@@ -388,13 +857,44 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 except CookieImportError as e:
                     self._json(400, {"ok": False, "error": str(e)})
                     return
-                cfg = settings.providers.setdefault(
-                    provider, dict(DEFAULT_PROVIDERS[provider])
-                )
-                cfg["enabled"] = True
-                cfg["cookie"] = imported.header
-                save_settings(settings)
-                core.quota.reload_fetchers()
+                try:
+                    with settings._lock:
+                        # Cookie/Keychain scanning is intentionally outside the
+                        # settings lock and can outlive bounded server drain.
+                        # Re-check at the real commit point so a late result can
+                        # never resurrect credentials during/after shutdown.
+                        admission.require_open()
+                        old_providers = settings.providers
+                        providers = json.loads(json.dumps(
+                            settings.providers or DEFAULT_PROVIDERS
+                        ))
+                        cfg = providers.setdefault(
+                            provider, dict(DEFAULT_PROVIDERS[provider])
+                        )
+                        cfg["enabled"] = True
+                        cfg["cookie"] = _clean_credential_field(
+                            imported.header, "Cookie", 65_536,
+                        )
+                        settings.providers = providers
+                        try:
+                            save_settings(settings)
+                        except Exception:
+                            settings.providers = old_providers
+                            raise
+                    core.quota.reload_fetchers()
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
+                except ValueError as e:
+                    self._json(400, {"ok": False, "error": str(e)})
+                    return
+                except OSError:
+                    self._persistence_unavailable("provider cookie import")
+                    return
+                except Exception:
+                    log.exception("provider cookie import save failed")
+                    self._json(500, {"ok": False, "error": "Cookie 保存失败"})
+                    return
                 self._json(200, {
                     **_provider_config_payload(settings),
                     "message": (
@@ -406,27 +906,54 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
             if path == "/api/debug/dispatch":
                 # 触发与真实菜单点击完全相同的 _dispatch 路径（主线程执行），
                 # 用于无 GUI 交互的端到端验证。白名单限定只读性动作。
+                if not self._trusted_local():
+                    self._json(403, {"ok": False, "error": "本机 UI 调试通道仅允许本机直连"})
+                    return
                 fn = hooks.get("dispatch")
                 action = str(body.get("action") or "")
                 if fn is None:
                     self._json(404, {"ok": False,
                                      "error": "menu bar 未运行（headless 无此通道）"})
                     return
-                if action not in {"open_panel", "quick_add", "refresh_quota",
-                                  "tunnel_start", "tunnel_stop"}:
+                scoped_refresh = (
+                    action.startswith("refresh_quota:")
+                    and bool(action.split(":", 1)[1].strip())
+                )
+                allowed = action in {
+                    "open_panel", "quick_add", "provider_settings",
+                    "tunnel_start", "tunnel_stop",
+                } or scoped_refresh
+                if not allowed:
                     self._json(400, {"ok": False, "error": f"action 不在白名单: {action!r}"})
+                    return
+                try:
+                    admission.require_open()
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
                     return
                 fn(action)
                 self._json(202, {"ok": True, "action": action})
                 return
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "tasks"]:
-                ok, msg = core.act(parts[3], parts[4])
+                try:
+                    admission.require_open()
+                    ok, msg = core.act(
+                        parts[3], parts[4], before_commit=admission.require_open,
+                    )
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
+                except OSError:
+                    self._persistence_unavailable("task action")
+                    return
                 self._json(200 if ok else 400, {"ok": ok, "message": msg, "error": msg})
                 return
             self._json(404, {"ok": False, "error": "not found"})
 
         def do_PUT(self):
+            if self._reject_if_stopping():
+                return
             if not self._host_ok():
                 self._json(403, {"ok": False, "error": "bad host"})
                 return
@@ -442,9 +969,23 @@ def _make_handler(core: Scheduler, settings: Settings, hooks: dict | None = None
                 self._json(404, {"ok": False, "error": "not found"})
                 return
             try:
-                t = core.edit_task(parts[3], self._body())
+                body = self._body()
+            except _BodyError as e:
+                self._json(e.status, {"ok": False, "error": str(e)})
+                return
+            try:
+                admission.require_open()
+                t = core.edit_task(
+                    parts[3], body, before_commit=admission.require_open,
+                )
+            except _AdmissionClosed:
+                self._reject_if_stopping()
+                return
             except ValueError as e:
                 self._json(400, {"ok": False, "error": str(e)})
+                return
+            except OSError:
+                self._persistence_unavailable("edit task")
                 return
             self._json(200, {"ok": True, "task": t.to_dict()})
 

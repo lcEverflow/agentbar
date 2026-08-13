@@ -1,12 +1,17 @@
 from agentbar.adapters.claude import ClaudeAdapter
 from agentbar.adapters.codex import CodexAdapter
 from agentbar.config import Settings
-from agentbar.models import Task
+from agentbar.models import EFFORTS, Task
 
 
 def _task(tool, profile="edits", session=None, model=None, effort=None):
     return Task(id="t1", title="t", prompt="do things", tool=tool, cwd="/tmp",
                 profile=profile, session_id=session, model=model, effort=effort)
+
+
+def test_cli_effort_union_covers_adapter_specific_extremes():
+    assert "minimal" in EFFORTS  # Codex-only
+    assert "max" in EFFORTS      # Claude-only
 
 
 def test_claude_default_is_safe(tmp_path):

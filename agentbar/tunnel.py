@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 from urllib.parse import urlparse
@@ -58,7 +59,11 @@ class TunnelManager:
     def status(self) -> dict:
         with self._lock:
             # 进程意外退出 → 降级为 error（reader 线程也会置，这里兜底）
-            if self._state == "up" and self._proc and self._proc.poll() is not None:
+            if (
+                self._state in ("starting", "up")
+                and self._proc
+                and self._proc.poll() is not None
+            ):
                 self._mark_down_locked("隧道进程已退出")
             return {"state": self._state, "url": self._url, "error": self._error,
                     "installed": self.binary() is not None}
@@ -88,11 +93,25 @@ class TunnelManager:
                  f"http://127.0.0.1:{self.port}"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, stdin=subprocess.DEVNULL,
+                # cloudflared may spawn helpers. A private process group lets
+                # stop() close every descendant that inherited the output pipe;
+                # otherwise the reader (and start()) can remain blocked after
+                # the direct child exits.
+                start_new_session=True,
             )
         except OSError as e:
             with self._lock:
                 self._state, self._error = "error", f"启动失败: {e}"
             return False
+
+        # Publish the process immediately. stop() may run while cloudflared is
+        # still starting; delaying this assignment until the URL appears leaks
+        # an untracked tunnel process during app shutdown.
+        with self._lock:
+            if self._state != "starting":
+                self._terminate_process(proc)
+                return False
+            self._proc = proc
 
         url_evt = threading.Event()
 
@@ -102,29 +121,84 @@ class TunnelManager:
                     m = _URL_RE.search(line)
                     if m:
                         with self._lock:
-                            self._url = m.group(0)
-                        url_evt.set()
+                            accepted = (
+                                self._proc is proc and self._state == "starting"
+                            )
+                            if accepted:
+                                self._url = m.group(0)
+                        if accepted:
+                            url_evt.set()
+            # Also wake start() when stop() terminates a still-starting process.
+            url_evt.set()
             with self._lock:
-                if self._proc is proc and self._state == "up":
+                # EOF can race with start() between accepting a URL and
+                # publishing state=up. Retire both phases atomically; otherwise
+                # an already-dead process can leave status() stuck at starting.
+                if self._proc is proc and self._state in ("starting", "up"):
                     self._mark_down_locked("隧道进程已退出")
 
         threading.Thread(target=_reader, name="agentbar-tunnel-io", daemon=True).start()
 
         if not url_evt.wait(timeout):
-            proc.terminate()
+            self._terminate_process(proc)
             with self._lock:
-                self._state = "error"
-                self._error = f"启动超时（{timeout:.0f}s，公司网络可能拦截 Cloudflare）"
+                if self._proc is proc:
+                    self._proc = None
+                if self._state == "starting":
+                    self._state = "error"
+                    self._error = f"启动超时（{timeout:.0f}s，公司网络可能拦截 Cloudflare）"
             return False
 
         with self._lock:
-            self._proc = proc
-            self._host = urlparse(self._url).hostname
-            self._state = "up"
-            host = self._host
+            if self._proc is not proc or self._state != "starting":
+                should_stop = True
+                host = None
+            elif proc.poll() is not None:
+                self._mark_down_locked("隧道进程已退出")
+                should_stop = True
+                host = None
+            else:
+                should_stop = False
+                self._host = urlparse(self._url).hostname
+                self._state = "up"
+                host = self._host
+        if should_stop:
+            self._terminate_process(proc)
+            return False
         log.info("tunnel up: %s", self._url)
+        notified_up = False
         if self._on_up and host:
-            self._on_up(host)
+            try:
+                self._on_up(host)
+                notified_up = True
+            except Exception as exc:
+                # A callback can fail after partially mutating its allow-list.
+                # Compensate and retire the process; otherwise start() would
+                # raise while leaving an untracked public tunnel alive.
+                log.exception("tunnel on_up callback failed")
+                with self._lock:
+                    if self._proc is proc and self._state == "up":
+                        self._proc, self._url, self._host = None, None, None
+                        self._state = "error"
+                        self._error = f"隧道注册失败: {exc}"
+                self._notify_down(host)
+                self._terminate_process(proc)
+                return False
+        # stop() may run after we publish state=up but while an arbitrary on_up
+        # callback is still executing. Re-check after notification and compensate
+        # a late allow-list add; callbacks must never run while holding _lock.
+        with self._lock:
+            still_up = (
+                self._proc is proc
+                and self._state == "up"
+                and self._host == host
+                and proc.poll() is None
+            )
+        if not still_up:
+            if notified_up and self._on_down and host:
+                self._notify_down(host)
+            self._terminate_process(proc)
+            return False
         return True
 
     def stop(self) -> None:
@@ -133,16 +207,36 @@ class TunnelManager:
             host = self._host
             self._state, self._url, self._host, self._error = "off", None, None, ""
         if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            self._terminate_process(proc)
         if self._on_down and host:
-            self._on_down(host)
+            self._notify_down(host)
         log.info("tunnel stopped")
 
     # ---------- internal ----------
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            except OSError:
+                proc.kill()
+            try:
+                proc.wait(3)
+            except subprocess.TimeoutExpired:
+                log.warning("cloudflared did not exit after SIGKILL")
 
     def _mark_down_locked(self, reason: str) -> None:
         """caller must hold self._lock"""
@@ -151,5 +245,15 @@ class TunnelManager:
         self._state, self._error = "error", reason
         if self._on_down and host:
             threading.Thread(
-                target=self._on_down, args=(host,), daemon=True
+                target=self._notify_down, args=(host,), daemon=True
             ).start()
+
+    def _notify_down(self, host: str) -> None:
+        """Best-effort compensating callback; never obstruct process cleanup."""
+        callback = self._on_down
+        if callback is None:
+            return
+        try:
+            callback(host)
+        except Exception:
+            log.exception("tunnel on_down callback failed for %s", host)

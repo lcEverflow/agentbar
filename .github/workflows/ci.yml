@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - run: uv run python -m compileall -q agentbar tests
+      - name: Core tests (Linux)
+        if: runner.os == 'Linux'
+        run: >-
+          uv run pytest
+          --ignore=tests/test_menubar.py
+          --ignore=tests/test_provider_window.py
+      - name: Full tests (macOS)
+        if: runner.os == 'macOS'
+        run: uv run pytest

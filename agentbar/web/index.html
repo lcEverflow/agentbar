@@ -36,6 +36,8 @@
   .providerTop input { min-width:0; flex:0; }
   .providerActions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
   .providerCookie { min-height:46px; font-family:ui-monospace,Menlo,monospace; }
+  .sourceSecret { width:100%; font-family:ui-monospace,Menlo,monospace; }
+  .providerSubhead { margin:12px 0 7px; }
   .providerStatus { min-height:18px; margin-top:6px; }
   .meter { height:6px; border-radius:6px; overflow:hidden; background:#2a2f37; }
   .meter > i { display:block; height:100%; background:var(--blue); border-radius:inherit; }
@@ -91,7 +93,6 @@
   <span class="chip" id="quota-claude" title="">Claude: …</span>
   <span class="chip" id="quota-codex" title="">Codex: …</span>
   <div class="spacer"></div>
-  <button id="btnRefreshQuota" title="立即触发真实额度接口刷新">↻ 刷新额度</button>
   <button id="btnPause">⏸ 全部暂停</button>
   <button id="btnResume">▶ 全部恢复</button>
 </header>
@@ -122,21 +123,24 @@
     </form>
   </section>
   <section>
-    <div class="sectionHead"><h2>订阅额度</h2><span class="dim">真实接口数据，默认每 120 秒刷新；获取失败会明确显示，不估算或伪造。</span>
-      <div class="spacer"></div><button class="mini" id="btnAuthorizeClaude" style="display:none">授权读取 Claude Keychain…</button></div>
+    <div class="sectionHead"><h2>订阅额度</h2><span class="dim">真实接口数据；默认仅在启动、保存设置或手动点刷新时请求，不会反复轮询。</span></div>
     <div class="quotaGrid" id="quotaGrid"></div>
   </section>
-  <section>
-    <div class="sectionHead"><h2>内部额度配置</h2><span class="dim">MyToken / Tokenverse 使用本机浏览器登录态；Cookie 只保存在 ~/.agentbar/config.json。</span>
+  <section id="providerConfigSection">
+    <div class="sectionHead"><h2>额度来源配置</h2><span class="dim">Claude / Codex 必须显式输入 OAuth Access Token；密钥不会回显。</span>
       <div class="spacer"></div>
+      <label class="dim"><input type="checkbox" id="usageAutoRefresh"/> 周期自动刷新</label>
       <select id="titleProvider" title="菜单栏标题显示哪个 provider 的用量">
         <option value="claude">标题：Claude</option>
         <option value="codex">标题：Codex</option>
         <option value="mytoken">标题：MyToken</option>
         <option value="tokenverse">标题：Tokenverse</option>
       </select>
-      <button class="mini primary" id="btnSaveProviders">保存并刷新</button>
+      <button class="mini primary" id="btnSaveProviders">保存配置</button>
     </div>
+    <div class="dim providerSubhead">订阅来源 · 保存时仅刷新有变更且凭据就绪的来源；关闭周期刷新后不再自动轮询。</div>
+    <div class="providerGrid" id="quotaSourceGrid"></div>
+    <div class="dim providerSubhead">内部来源 · MyToken / Tokenverse 使用本机浏览器登录态；Cookie 只保存在 ~/.agentbar/config.json。</div>
     <div class="providerGrid" id="providerGrid"></div>
   </section>
   <section>
@@ -171,21 +175,31 @@
 
 <script>
 const $ = id => document.getElementById(id);
-// ---- token：来自 URL ?token=（菜单栏/CLI 打开时携带），存 localStorage ----
+// ---- token bootstrap：只从 URL fragment 读取，随后存当前标签页的 sessionStorage ----
 const OPEN_REQUEST = (() => {
   const u = new URL(location.href);
-  const t = u.searchParams.get("token");
-  const request = { tool: u.searchParams.get("tool"), focus: u.searchParams.get("focus") };
-  if (t) { localStorage.setItem("agentbar_token", t);
-           u.searchParams.delete("token"); history.replaceState(null, "", u); }
+  const fragment = new URLSearchParams(u.hash.replace(/^#/, ""));
+  const t = fragment.get("token");
+  const request = {
+    tool: fragment.get("tool") || u.searchParams.get("tool"),
+    focus: fragment.get("focus") || u.searchParams.get("focus"),
+  };
+  if (t) sessionStorage.setItem("agentbar_token", t);
+  // v0.10.3 之前曾把访问令牌长期保存在 localStorage。升级后主动
+  // 删除遗留值，但绝不读取/迁移它；当前标签页只信任 fragment/sessionStorage。
+  try { localStorage.removeItem("agentbar_token"); } catch (_) {}
+  if (u.hash) history.replaceState(null, "", u.pathname + u.search);
   return request;
 })();
-const TOKEN = () => localStorage.getItem("agentbar_token") || "";
+const TOKEN = () => sessionStorage.getItem("agentbar_token") || "";
 
 function showBanner(msg) { const b = $("banner"); b.textContent = msg; b.style.display = "block"; }
 function hideBanner() { $("banner").style.display = "none"; }
 
 async function api(path, opts = {}) {
+  opts.cache = "no-store";
+  opts.credentials = "omit";
+  opts.referrerPolicy = "no-referrer";
   opts.headers = Object.assign({ "X-Agentbar-Token": TOKEN(),
                                  "Content-Type": "application/json" }, opts.headers || {});
   const r = await fetch(path, opts);
@@ -217,16 +231,17 @@ function stateCell(t) {
 
 function btns(t) {
   const b = [];
-  const act = (a, label) => `<button class="mini" onclick="doAct('${t.id}','${a}')">${label}</button>`;
+  const id = esc(t.id);
+  const act = (a, label) => `<button class="mini" onclick="doAct('${id}','${a}')">${label}</button>`;
   if (["queued", "waiting_quota", "paused"].includes(t.state)) {
-    b.push(`<button class="mini" onclick="beginEdit('${t.id}')">编辑</button>`);
+    b.push(`<button class="mini" onclick="beginEdit('${id}')">编辑</button>`);
   }
   if (t.state === "queued")        b.push(act("pause","暂停"), act("cancel","取消"));
   if (t.state === "running")       b.push(act("cancel","取消"));
   if (t.state === "waiting_quota") b.push(act("resume","立即重试"), act("pause","暂停"), act("cancel","取消"));
   if (t.state === "paused")        b.push(act("resume","恢复"), act("cancel","取消"));
   if (["succeeded","failed","cancelled"].includes(t.state)) b.push(act("retry","重试"));
-  b.push(`<button class="mini" onclick="openLog('${t.id}',this)">日志</button>`);
+  b.push(`<button class="mini" onclick="openLog('${id}',this)">日志</button>`);
   return b.join(" ");
 }
 
@@ -265,13 +280,49 @@ function quotaCards(quota) {
       const warn = pct >= 90 ? "warn" : "";
       return `<div class="quotaWindow"><span class="dim">${esc(w.label)}</span><span class="meter ${warn}"><i style="width:${pct}%"></i></span><span>${esc(windowValue(w))}</span></div><div class="dim">${w.resets_at ? `重置：${dateClock(w.resets_at)}` : "未提供重置时间"}</div>`;
     }).join("");
-    return `<div class="quotaCard"><div class="quotaTitle"><b>${esc(PROVIDER_NAMES[tool] || tool)}</b><span class="origin">${esc(qi.source || "unknown")}</span></div>${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}` : "未取得实时数据"}</div></div>`;
+    const available = (qi.available_models || []).length
+      ? `<div class="dim">可选额度标识：${esc(qi.available_models.join(" / "))}</div>` : "";
+    return `<div class="quotaCard"><div class="quotaTitle"><b>${esc(PROVIDER_NAMES[tool] || tool)}</b><span class="origin">${esc(qi.source || "unknown")}${qi.stale ? " · 已过期" : ""}</span></div>${qi.model ? `<div class="dim">额度模型 / metered_feature：${esc(qi.model)}</div>` : ""}${available}${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}${qi.stale ? "（已过期，不参与调度判定）" : ""}` : "未取得实时数据"}</div></div>`;
   }).join("");
 }
 
 function renderProviderConfig(cfg) {
   providerConfig = cfg;
   $("titleProvider").value = cfg.title_provider || "claude";
+  $("usageAutoRefresh").checked = !!cfg.usage_auto_refresh;
+  const sources = cfg.quota_sources || {};
+  $("quotaSourceGrid").innerHTML = ["claude", "codex"].map(name => {
+    const p = sources[name] || {};
+    const label = PROVIDER_NAMES[name] || name;
+    const configured = p.key_set
+      ? `OAuth Access Token 已配置${name === "codex" && p.account_id_set ? " · Account ID 已配置" : ""}`
+      : "未配置 OAuth Access Token";
+    const modelLabel = name === "claude" ? "额度模型" : "metered_feature";
+    const modelHint = name === "claude"
+      ? "opus / sonnet；留空=账户通用窗口"
+      : "接口返回的 metered_feature；留空=账户总额度";
+    const account = name === "codex" ? `<input id="q-codex-account" autocomplete="off" placeholder="Codex Account ID（可选；留空保留已配置值）"/>` : "";
+    return `<div class="providerCard" data-quota-source="${name}">
+      <div class="providerTop">
+        <label><input type="checkbox" id="q-${name}-enabled" ${p.enabled ? "checked" : ""}/> ${esc(label)}</label>
+        <span class="origin">手动 OAuth</span>
+      </div>
+      <div class="row">
+        <input id="q-${name}-model" value="${esc(p.model || "")}" placeholder="${esc(modelLabel + " · " + modelHint)}" title="${esc(modelHint)}"/>
+        ${account}
+      </div>
+      <input class="sourceSecret" id="q-${name}-key" type="password" autocomplete="off" spellcheck="false"
+             placeholder="OAuth Access Token（留空保留已配置值）"/>
+      <div class="providerActions">
+        <button class="mini" onclick="refreshQuotaSource('${name}')" ${p.enabled && p.key_set ? "" : "disabled"}>刷新此来源</button>
+        ${name === "codex" ? `<button class="mini" onclick="clearCodexAccountId()" ${p.account_id_set ? "" : "disabled"}>清空 Account ID</button>` : ""}
+        <button class="mini" onclick="clearQuotaSource('${name}')">清空 Access Token</button>
+        <span class="dim">${configured}${p.enabled ? "" : " · 已停用"}</span>
+      </div>
+      <div class="dim providerStatus" id="q-${name}-status"></div>
+    </div>`;
+  }).join("");
+
   const providers = cfg.providers || {};
   $("providerGrid").innerHTML = ["mytoken", "tokenverse"].map(name => {
     const p = providers[name] || {};
@@ -294,6 +345,7 @@ function renderProviderConfig(cfg) {
       </div>
       <textarea class="providerCookie" id="p-${name}-cookie" placeholder="可选：手动粘贴 ${esc(label)} 的 Request Headers Cookie；留空保存时不改已有 Cookie"></textarea>
       <div class="providerActions">
+        <button class="mini" onclick="refreshQuotaSource('${name}')" ${p.enabled && p.cookie_set ? "" : "disabled"}>刷新此来源</button>
         <button class="mini" onclick="importProviderCookie('${name}')">从浏览器导入 Cookie</button>
         <button class="mini" onclick="clearProviderCookie('${name}')">清空 Cookie</button>
         <span class="dim">${cookieState}</span>
@@ -319,7 +371,29 @@ function providerPayload(includeEmptyCookie = false) {
     };
     if (cookie || includeEmptyCookie) providers[name].cookie = cookie;
   }
-  return { providers, title_provider: $("titleProvider").value };
+  const quotaSources = {};
+  const configuredSources = (providerConfig && providerConfig.quota_sources) || {};
+  for (const name of ["claude", "codex"]) {
+    const accessToken = $(`q-${name}-key`).value.trim();
+    const enabled = $(`q-${name}-enabled`).checked;
+    if (enabled && !accessToken && !(configuredSources[name] || {}).key_set)
+      throw new Error(`${PROVIDER_NAMES[name] || name} 启用前必须输入 OAuth Access Token`);
+    quotaSources[name] = {
+      enabled,
+      model: $(`q-${name}-model`).value.trim(),
+    };
+    if (accessToken) quotaSources[name].access_token = accessToken;
+    if (name === "codex") {
+      const accountId = $("q-codex-account").value.trim();
+      if (accountId) quotaSources[name].account_id = accountId;
+    }
+  }
+  return {
+    providers,
+    quota_sources: quotaSources,
+    usage_auto_refresh: $("usageAutoRefresh").checked,
+    title_provider: $("titleProvider").value,
+  };
 }
 
 async function saveProviderConfig(includeEmptyCookie = false) {
@@ -353,17 +427,63 @@ window.clearProviderCookie = async name => {
   if (!$(`p-${name}-cookie`)) return;
   $(`p-${name}-cookie`).value = "";
   $(`p-${name}-enabled`).checked = false;
-  const payload = providerPayload(false);
-  payload.providers = { [name]: {
+  // Destructive actions are target-only. Do not save unrelated edits that
+  // happen to be present in the rest of the settings form.
+  const payload = { providers: { [name]: {
     enabled: false,
-    unit: $(`p-${name}-unit`).value,
-    refresh_seconds: Number($(`p-${name}-refresh`).value) || 300,
     cookie: "",
-  } };
+  } } };
   try {
     const j = await api("/api/provider-config", {
       method:"POST",
       body: JSON.stringify(payload),
+    });
+    renderProviderConfig(j);
+    await refresh();
+  } catch (e) { alert("清空失败: " + e.message); }
+};
+
+window.refreshQuotaSource = async name => {
+  const status = $(`q-${name}-status`) || $(`p-${name}-status`);
+  status.textContent = "正在触发一次手动刷新…";
+  try {
+    const j = await api("/api/quota/refresh", {
+      method:"POST",
+      body: JSON.stringify({ tool: name }),
+    });
+    status.textContent = j.message || "已触发手动刷新";
+    setTimeout(refresh, 500);
+  } catch (e) {
+    status.textContent = e.message;
+    alert("刷新失败: " + e.message);
+  }
+};
+
+window.clearQuotaSource = async name => {
+  if (!confirm(`清空 ${PROVIDER_NAMES[name] || name} OAuth Access Token 并停用该来源？`)) return;
+  const payload = {
+    quota_sources: { [name]: {
+      enabled: false,
+      access_token: "",
+      account_id: "",
+    } },
+  };
+  try {
+    const j = await api("/api/provider-config", {
+      method:"POST",
+      body: JSON.stringify(payload),
+    });
+    renderProviderConfig(j);
+    await refresh();
+  } catch (e) { alert("清空失败: " + e.message); }
+};
+
+window.clearCodexAccountId = async () => {
+  if (!confirm("清空 Codex Account ID？OAuth Access Token 保持不变。")) return;
+  try {
+    const j = await api("/api/provider-config", {
+      method:"POST",
+      body: JSON.stringify({ quota_sources: { codex: { account_id: "" } } }),
     });
     renderProviderConfig(j);
     await refresh();
@@ -395,8 +515,6 @@ function render(s) {
     el.title = `${qi.detail}（来源: ${qi.source}）`;
   }
   $("quotaGrid").innerHTML = quotaCards(s.quota);
-  const authorize = $("btnAuthorizeClaude");
-  authorize.style.display = s.quota.claude && String(s.quota.claude.error || "").includes("Keychain") ? "inline-block" : "none";
   const active = s.tasks.filter(t => ["queued","running","waiting_quota","paused"].includes(t.state));
   const hist = s.tasks.filter(t => ["succeeded","failed","cancelled"].includes(t.state)).reverse();
   $("activeBody").innerHTML = active.map(t => `<tr>
@@ -431,11 +549,14 @@ async function refresh() {
   catch (e) { if (e.message !== "401") showBanner("无法连接调度器（agentbar 未运行？）"); }
 }
 
+let availableTools = [];
+
 async function loadTools() {
   try {
     const j = await api("/api/tools");
-    $("fTool").innerHTML = j.tools.map(t =>
-      `<option value="${t.name}" ${t.installed ? "" : "disabled"}>${t.display_name}${t.installed ? "" : "（未安装）"}</option>`).join("");
+    availableTools = j.tools || [];
+    $("fTool").innerHTML = availableTools.map(t =>
+      `<option value="${esc(t.name)}" ${t.installed ? "" : "disabled"}>${esc(t.display_name)}${t.installed ? "" : "（未安装）"}</option>`).join("");
     if (OPEN_REQUEST.tool) {
       const requested = [...$("fTool").options].find(o => o.value === OPEN_REQUEST.tool && !o.disabled);
       if (requested) $("fTool").value = requested.value;
@@ -447,13 +568,13 @@ async function loadTools() {
 
 function updateModelChoices() {
   const tool = $("fTool").value;
-  const presets = tool === "claude" ? ["sonnet", "opus", "fable"] : [];
-  $("modelChoices").innerHTML = presets.map(v => `<option value="${v}">`).join("");
-  const efforts = tool === "claude" ? ["low", "medium", "high", "xhigh", "max"]
-                                      : ["low", "medium", "high", "xhigh"];
-  $("fEffort").innerHTML = `<option value="">默认强度</option>` + efforts.map(v => `<option value="${v}">${v}</option>`).join("");
+  const info = availableTools.find(t => t.name === tool) || {};
+  const presets = info.models || [];
+  $("modelChoices").innerHTML = presets.map(v => `<option value="${esc(v)}">`).join("");
+  const efforts = info.efforts || [];
+  $("fEffort").innerHTML = `<option value="">默认强度</option>` + efforts.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
   $("modelHint").textContent = tool === "claude"
-    ? "Claude 可选模型别名：sonnet / opus / fable；强度会传给 --effort。"
+    ? "Claude 模型候选与强度来自当前适配器；也可输入账号已开放的模型 ID。"
     : "Codex：填写账号已开放的模型 ID；强度通过其 config override 设置。留空即使用你的 Codex 默认配置。";
 }
 
@@ -527,8 +648,6 @@ $("fTool").onchange = updateModelChoices;
 $("btnCancelEdit").onclick = cancelEdit;
 $("btnPause").onclick = () => api("/api/pause-all", { method:"POST" }).then(refresh).catch(e => alert(e.message));
 $("btnResume").onclick = () => api("/api/resume-all", { method:"POST" }).then(refresh).catch(e => alert(e.message));
-$("btnRefreshQuota").onclick = () => api("/api/quota/refresh", { method:"POST" }).then(refresh).catch(e => alert(e.message));
-$("btnAuthorizeClaude").onclick = () => api("/api/quota/authorize-claude", { method:"POST" }).then(refresh).catch(e => alert(e.message));
 $("btnSaveProviders").onclick = () => saveProviderConfig(false).catch(e => alert("保存失败: " + e.message));
 
 loadTools(); loadProviderConfig(); refresh(); setInterval(refresh, 2000);

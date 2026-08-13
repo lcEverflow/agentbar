@@ -1,13 +1,13 @@
 """macOS menu-bar frontend — raw AppKit (NSStatusItem + NSMenu), rumps removed.
 
 为什么不用 rumps：在 macOS 26 上出现两类事故——
-1. 菜单回调在主线程做阻塞调用（等 `open`、Keychain+HTTP）→ 整个 App 卡死；
+1. 菜单回调在主线程做阻塞调用（等 `open`、登录或 HTTP）→ 整个 App 卡死；
 2. rumps.Timer 每 2s clear+rebuild 打开中的菜单 → 菜单项点击落空。
 
 本实现的纪律：
 - 菜单内容只在 menuWillOpen（AppKit 正统时机）重建；NSTimer 只更新标题文本。
 - 所有 action 回调毫秒级返回：浏览器用 open_url_async（fire-and-forget），
-  Keychain 授权丢后台线程，结果经 AppHelper.callAfter 回主线程弹提示。
+  登录、Cookie 导入等慢操作都在后台线程执行。
 - setAutoenablesItems(False) + 显式 setEnabled，杜绝系统校验导致的置灰。
 - 每次重建后把真实 NSMenu 状态导出到 state_dir/menu-debug.json，可实证核查。
 
@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
+from html import escape
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import objc
 from AppKit import (
@@ -58,6 +62,30 @@ _RINGS = (
     (7.2, 1.75, 0.22, 1.0),
     (4.35, 1.65, 0.18, 0.78),
 )
+
+
+def _atomic_private_write(path, text: str) -> None:
+    """Atomically replace a sensitive debug artifact with mode 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1  # ownership transferred to ``stream``
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _ring_icon(outer: float | None, inner: float | None, status: str = "idle") -> NSImage:
@@ -110,6 +138,9 @@ def _qr_page_html(url: str, mode: str = "局域网", note: str = "") -> str:
 
     img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage)
     svg = img.to_string().decode()
+    safe_url = escape(url)
+    safe_mode = escape(mode)
+    safe_note = escape(note or "链接含访问令牌，勿外传")
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 body{{font-family:-apple-system,sans-serif;margin:0;padding:20px;text-align:center;
      background:#fff;color:#1c1c1e}}
@@ -120,11 +151,28 @@ p{{font-size:12px;color:#8e8e93;margin:4px 0}}
      background:#f2f2f7;border-radius:8px;padding:8px;margin-top:10px;
      user-select:all;-webkit-user-select:all}}
 </style></head><body>
-<h3>手机扫码 · 查看/提交任务（{mode}）</h3>
-<p>{note or "链接含访问令牌，勿外传"}</p>
+<h3>手机扫码 · 查看/提交任务（{safe_mode}）</h3>
+<p>{safe_note}</p>
 {svg}
-<div class="url">{url}</div>
+<div class="url">{safe_url}</div>
 </body></html>"""
+
+
+def _token_fragment_url(url: str, token: str) -> str:
+    """Put the bootstrap token in a fragment, outside HTTP requests and logs."""
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in parse_qsl(parts.query) if key != "token"]
+    fragment = [
+        (key, value) for key, value in parse_qsl(parts.fragment) if key != "token"
+    ]
+    fragment.append(("token", token))
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(query),
+        urlencode(fragment),
+    ))
 
 
 class _Bridge(NSObject):
@@ -158,9 +206,14 @@ class AgentBarApp:
         self._menu = None
         self._timer = None
         self._panel = None  # 原生任务面板窗口（懒加载）
+        self._provider_panel = None  # MyToken / Tokenverse 原生设置窗口（懒加载）
         self._ring_key = None    # 双环图标缓存键（进度没变不重画，避免 2s 一次的无谓刷新）
         self._qr_window = None   # 手机访问二维码窗口（懒加载）
         self._qr_webview = None  # 二维码窗口里的 WKWebView（内容可切换 LAN/公网）
+        self._debug_lock = threading.Lock()
+        self._debug_pending: tuple[object, str] | None = None
+        self._debug_worker_running = False
+        self._closing = threading.Event()
         from .tunnel import TunnelManager
         self.tunnel = TunnelManager(
             server.port, on_up=server.allow_host, on_down=server.disallow_host
@@ -196,8 +249,20 @@ class AgentBarApp:
         """信号处理线程调用：清理已在外部完成，只负责停掉主事件循环。"""
         AppHelper.callAfter(self._terminate)
 
+    def begin_shutdown(self) -> None:
+        """Close menu/debug action admission before retiring external resources."""
+        self._closing.set()
+
+    def close_active_provider_logins(self) -> None:
+        """Safe from shutdown threads; no-op until the provider window is opened."""
+        panel = self._provider_panel
+        if panel is not None:
+            panel.close_active_logins()
+
     def dispatch_async(self, action: str) -> None:
         """任意线程安全：把动作转投主线程，与真实菜单点击走同一 _dispatch。"""
+        if self._closing.is_set() or getattr(self.server, "stopping", False):
+            return
         AppHelper.callAfter(self._dispatch, action)
 
     def _terminate(self) -> None:
@@ -319,16 +384,25 @@ class AgentBarApp:
     # ---------- actions（必须毫秒级返回，禁止任何阻塞） ----------
 
     def _dispatch(self, action: str) -> None:
+        # An action may already be queued on AppKit when SIGTERM begins. Drop it
+        # at execution time too, so a late tunnel_start cannot recreate a child
+        # after shutdown has stopped and cleared the current tunnel.
+        if action != "quit" and (
+            self._closing.is_set() or getattr(self.server, "stopping", False)
+        ):
+            return
         log.info("menu action: %s", action)
         try:
             if action == "open_panel":
                 self._show_panel(False)
             elif action == "quick_add":
                 self._show_panel(True)
-            elif action == "refresh_quota":
-                self.core.quota.refresh_now()  # 异步：只置事件
-            elif action == "authorize_keychain":
-                self._authorize_keychain_bg()
+            elif action == "provider_settings":
+                self._show_provider_settings()
+            elif action.startswith("refresh_quota:"):
+                tool = action.split(":", 1)[1].strip()
+                if tool:
+                    self.core.quota.refresh_now(tool)
             elif action == "pause_all":
                 self.core.pause_all()
             elif action == "resume_all":
@@ -357,8 +431,20 @@ class AgentBarApp:
             )
         self._panel.show_(focus_prompt)
 
+    def _show_provider_settings(self) -> None:
+        """原生内部额度设置：菜单里始终可发现，不再藏在 Web 面板。"""
+        if self._provider_panel is None:
+            from .provider_window import ProviderSettingsWindowController
+
+            self._provider_panel = (
+                ProviderSettingsWindowController.alloc().initWithCore_settings_(
+                    self.core, self.settings
+                )
+            )
+        self._provider_panel.show_(None)
+
     def _show_mobile_qr(self) -> None:
-        """局域网扫码：http://<LAN IP>:<port>/m?token=…（手机与 Mac 同一 Wi-Fi）。"""
+        """局域网扫码；访问令牌只放 URL fragment。"""
         url = self.server.mobile_url()
         if not url:
             self._alert(
@@ -366,7 +452,11 @@ class AgentBarApp:
                 "未获取到局域网 IP（Mac 未联网？），或 config.json 中 lan_access 已关闭。",
             )
             return
-        self._show_qr_window(url, "局域网", "手机需与 Mac 连同一 Wi-Fi")
+        self._show_qr_window(
+            _token_fragment_url(url, self.settings.token),
+            "局域网",
+            "手机需与 Mac 连同一 Wi-Fi",
+        )
 
     def _start_tunnel_bg(self) -> None:
         """开通公网隧道（cloudflared，阻塞 ~5-15s → 后台线程），成功后自动弹二维码。"""
@@ -386,7 +476,7 @@ class AgentBarApp:
             self._alert("公网访问", "隧道未开通（先点「开通公网访问」）。")
             return
         self._show_qr_window(
-            f"{url}/m?token={self.settings.token}",
+            _token_fragment_url(f"{url.rstrip('/')}/m", self.settings.token),
             "公网（Cloudflare Tunnel）",
             "任何网络可达 · 链接含令牌切勿外传 · 每次开通域名会变",
         )
@@ -422,22 +512,6 @@ class AgentBarApp:
             log.exception("qr window failed")
             self._alert("手机访问", f"二维码窗口创建失败；手机浏览器直接打开：\n{url}")
 
-    def _authorize_keychain_bg(self) -> None:
-        def work():
-            try:
-                ok = self.core.quota.authorize_claude_keychain()
-            except Exception:
-                log.exception("keychain authorize failed")
-                ok = False
-            msg = (
-                "已取得 Keychain 授权，额度数据已刷新。"
-                if ok
-                else "未能读取 Keychain；请确认已登录 Claude Code 后重试。"
-            )
-            AppHelper.callAfter(self._alert, "Claude 额度", msg)
-
-        threading.Thread(target=work, name="agentbar-keychain", daemon=True).start()
-
     def _alert(self, title: str, text: str) -> None:
         self._nsapp.activateIgnoringOtherApps_(True)
         alert = NSAlert.alloc().init()
@@ -447,13 +521,28 @@ class AgentBarApp:
 
     def _quit(self) -> None:
         log.info("quit from menu")
+        self.begin_shutdown()
+        first_error = None
         try:
-            self.tunnel.stop()  # 杀掉 cloudflared，避免孤儿进程占着公网域名
-            self.core.shutdown()
-            self.server.stop()
-            self.core.store.clear_runtime()
+            for label, action in (
+                # Stop admission first. Scheduler shutdown may wait for active
+                # CLI processes; HTTP cannot remain open during that window.
+                ("HTTP server", self.server.stop),
+                ("public tunnel", self.tunnel.stop),
+                ("provider login", self.close_active_provider_logins),
+                ("scheduler", self.core.shutdown),
+                ("runtime file", self.core.store.clear_runtime),
+            ):
+                try:
+                    action()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    log.exception("quit cleanup failed: %s", label)
         finally:
             self._terminate()
+        if first_error is not None:
+            raise first_error
 
     # ---------- evidence ----------
 
@@ -462,10 +551,36 @@ class AgentBarApp:
             payload = {"ts": time.time(), "title": str(self._item.button().title()),
                        "items": self._dump(self._menu)}
             path = self.settings.state_dir / "menu-debug.json"
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                            encoding="utf-8")
+            text = json.dumps(payload, ensure_ascii=False, indent=1)
         except Exception:
             log.debug("menu debug dump failed", exc_info=True)
+            return
+        with self._debug_lock:
+            # Menu open is a UI path. Coalesce rapid rebuilds and keep fsync off
+            # the AppKit thread; the newest snapshot always drains last.
+            self._debug_pending = (path, text)
+            if self._debug_worker_running:
+                return
+            self._debug_worker_running = True
+        threading.Thread(
+            target=self._drain_debug_dump,
+            name="agentbar-menu-debug",
+            daemon=True,
+        ).start()
+
+    def _drain_debug_dump(self) -> None:
+        while True:
+            with self._debug_lock:
+                job = self._debug_pending
+                self._debug_pending = None
+                if job is None:
+                    self._debug_worker_running = False
+                    return
+            path, text = job
+            try:
+                _atomic_private_write(path, text)
+            except Exception:
+                log.debug("menu debug dump failed", exc_info=True)
 
     def _dump(self, menu) -> list[dict]:
         out = []
