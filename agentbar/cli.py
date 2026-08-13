@@ -7,12 +7,13 @@ import json
 import logging
 import os
 import signal
+import stat
 import sys
 import threading
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlencode
 
 from . import __version__
 from .browser import open_panel_url
@@ -24,11 +25,21 @@ from .store import StateStore
 
 
 def _setup_logging(settings: Settings) -> None:
+    log_path = settings.state_dir / "agentbar.log"
+    fd = os.open(
+        log_path,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+    finally:
+        os.close(fd)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
-            logging.FileHandler(settings.state_dir / "agentbar.log", encoding="utf-8"),
+            logging.FileHandler(log_path, encoding="utf-8"),
             logging.StreamHandler(),
         ],
     )
@@ -77,60 +88,132 @@ def _instance_alive(settings: Settings) -> bool:
 # ---------------- subcommands ----------------
 
 
-def cmd_run(args, settings: Settings) -> int:
+def _cleanup_runtime(core, server, store, app=None) -> None:
+    """Run every shutdown stage even if an earlier one fails."""
+    first_error: Exception | None = None
+    actions = []
+    if app is not None:
+        begin_shutdown = getattr(app, "begin_shutdown", None)
+        if callable(begin_shutdown):
+            actions.append(("menu actions", begin_shutdown))
+    actions.append(("HTTP server", server.stop))
+    if app is not None:
+        actions.extend([
+            ("public tunnel", app.tunnel.stop),
+            ("provider login", app.close_active_provider_logins),
+        ])
+    actions.extend([
+        ("scheduler", core.shutdown),
+        ("runtime file", store.clear_runtime),
+    ])
+    for label, action in actions:
+        try:
+            action()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            logging.getLogger("agentbar.cli").exception("failed to stop %s", label)
+    if first_error is not None:
+        raise first_error
+
+
+def cmd_run(args, settings: Settings, *, instance_checked: bool = False) -> int:
     # 先应用端口覆盖再查重：实例身份 = state dir + 端口，
     # 否则 --port/--state-dir 启动的独立实例会被别的实例误判为"已在运行"
     if args.port is not None:
         settings.port = args.port
-    if _instance_alive(settings):
+    if not instance_checked and _instance_alive(settings):
         print("AgentBar 已在运行（用 `agentbar open` 打开面板，或先退出旧实例）")
         return 2
     _setup_logging(settings)
     store = StateStore(settings.state_dir)
     core = Scheduler(settings, store)
-    server = ApiServer(core, settings)
-    server.start()
-    core.start()
-    store.write_runtime(server.port)
-
-    print(f"AgentBar v{__version__} 已启动")
-    print(f"  状态目录: {settings.state_dir}")
-    print(f"  任务面板: {server.url(with_token=True)}")
-    print(f"  模式:     {'headless' if args.headless else 'menu bar'}")
-
+    server = None
     stop_evt = threading.Event()
 
     def _graceful(*_):
         stop_evt.set()
 
-    signal.signal(signal.SIGTERM, _graceful)
-    signal.signal(signal.SIGINT, _graceful)
+    try:
+        # Install termination admission before starting any thread/listener.
+        # Otherwise SIGTERM in the startup window takes the default hard-exit
+        # path and can strand a freshly dispatched CLI child.
+        signal.signal(signal.SIGTERM, _graceful)
+        signal.signal(signal.SIGINT, _graceful)
+        server = ApiServer(core, settings)
+        server.start()
+        core.start()
+        store.write_runtime(server.port)
+    except Exception:
+        try:
+            if server is not None:
+                _cleanup_runtime(core, server, store)
+            else:
+                # ApiServer construction itself may fail after a stale runtime
+                # file was left behind. Scheduler has not started, but shutdown
+                # is safe.
+                try:
+                    core.shutdown()
+                finally:
+                    store.clear_runtime()
+        except Exception:
+            # Cleanup failures are already logged; preserve the startup failure
+            # that explains why this rollback was necessary.
+            pass
+        raise
+
+    if stop_evt.is_set():
+        _cleanup_runtime(core, server, store)
+        return 0
+
+    try:
+        print(f"AgentBar v{__version__} 已启动")
+        print(f"  状态目录: {settings.state_dir}")
+        # 启动输出会被 launchd 持久化，绝不打印访问令牌。
+        print(f"  任务面板: {server.url()}")
+        print(f"  模式:     {'headless' if args.headless else 'menu bar'}")
+    except Exception:
+        try:
+            _cleanup_runtime(core, server, store)
+        except Exception:
+            pass
+        raise
 
     if args.headless:
         try:
             while not stop_evt.wait(0.5):
                 pass
         finally:
-            core.shutdown()
-            server.stop()
-            store.clear_runtime()
+            _cleanup_runtime(core, server, store)
         return 0
 
     # menu bar 模式：AppKit 事件循环占主线程；信号在后台线程清理后停掉主循环
-    from .menubar import AgentBarApp  # 延迟 import，headless/测试不依赖 pyobjc
+    try:
+        from .menubar import AgentBarApp  # 延迟 import，headless/测试不依赖 pyobjc
 
-    app = AgentBarApp(core, settings, server)
-    server.hooks["dispatch"] = app.dispatch_async  # /api/debug/dispatch 通道
+        app = AgentBarApp(core, settings, server)
+        server.hooks["dispatch"] = app.dispatch_async  # /api/debug/dispatch 通道
+    except Exception:
+        try:
+            _cleanup_runtime(core, server, store)
+        except Exception:
+            pass
+        raise
 
     def _watch_signal():
         stop_evt.wait()
-        core.shutdown()
-        server.stop()
-        store.clear_runtime()
-        app.stop_from_thread()
+        try:
+            _cleanup_runtime(core, server, store, app)
+        finally:
+            app.stop_from_thread()
 
-    threading.Thread(target=_watch_signal, daemon=True).start()
-    app.run()
+    try:
+        threading.Thread(target=_watch_signal, daemon=True).start()
+        app.run()
+    finally:
+        # Normal menu quit cleans up before terminating AppKit; this also covers
+        # an unexpected event-loop return. All component stops are idempotent.
+        _cleanup_runtime(core, server, store, app)
     return 0
 
 
@@ -181,11 +264,17 @@ def cmd_status(args, settings: Settings) -> int:
 
 def cmd_open(args, settings: Settings) -> int:
     base, token = _endpoint(settings)
-    url = f"{base}/?token={token}"
-    print(url)
+    # Fragment 只由浏览器端消费，不会进入 HTTP/proxy 日志。
+    # 终端只显示无凭据基础 URL，避免 shell 历史/日志泄漏 token。
+    url = f"{base}/#{urlencode({'token': token})}"
+    print(f"正在打开 AgentBar 面板：{base}/")
     if _instance_alive(settings):
         if not open_panel_url(url):
-            print("无法调用 macOS 浏览器；请复制上面的链接手动打开。", file=sys.stderr)
+            print(
+                "无法调用 macOS 浏览器；为避免泄漏访问令牌，"
+                "未在终端输出完整链接。请从 AgentBar 菜单栏打开面板。",
+                file=sys.stderr,
+            )
             return 1
     else:
         print("（调度器未运行，先执行 agentbar run）")
@@ -226,7 +315,7 @@ def main(argv: list[str] | None = None) -> None:
 
     sp = sub.add_parser("run", help="启动调度器（默认带菜单栏）")
     sp.add_argument("--headless", action="store_true", help="无菜单栏模式（服务器/调试）")
-    sp.add_argument("--port", type=int, help=f"API 端口（默认取配置）")
+    sp.add_argument("--port", type=int, help="API 端口（默认取配置）")
     sp.set_defaults(fn=cmd_run)
 
     sp = sub.add_parser("add", help="添加任务")
@@ -257,5 +346,17 @@ def main(argv: list[str] | None = None) -> None:
     sp.set_defaults(fn=cmd_log)
 
     args = p.parse_args(argv)
-    settings = load_settings(Path(args.state_dir) if args.state_dir else None)
-    sys.exit(args.fn(args, settings) or 0)
+    state_dir = Path(args.state_dir) if args.state_dir else None
+    # Client commands must retain the token understood by an older process that
+    # is still running. Secure schema/token migration belongs to the next server
+    # start, not to `status`, `open`, or another read/write client invocation.
+    provisional = load_settings(state_dir, migrate=False)
+    if args.cmd == "run":
+        if args.port is not None:
+            provisional.port = args.port
+        if _instance_alive(provisional):
+            print("AgentBar 已在运行（用 `agentbar open` 打开面板，或先退出旧实例）")
+            sys.exit(2)
+        settings = load_settings(state_dir, migrate=True)
+        sys.exit(cmd_run(args, settings, instance_checked=True) or 0)
+    sys.exit(args.fn(args, provisional) or 0)

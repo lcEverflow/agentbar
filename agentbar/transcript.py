@@ -7,6 +7,7 @@ import html
 import json
 import os
 import re
+import shlex
 import time
 from pathlib import Path
 
@@ -14,12 +15,11 @@ from pathlib import Path
 
 _HTML_TEMPLATE = """\
 <!DOCTYPE html><html><head><meta charset="utf-8">
-<script>
-MathJax = {{tex:{{inlineMath:[['$','$'],['\\\\(','\\\\)']],
-                  displayMath:[['$$','$$'],['\\\\[','\\\\]']]}},
-           options:{{skipHtmlTags:['script','noscript','style','textarea','pre']}}}};
-</script>
-<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none';
+               img-src data:; media-src 'none'; object-src 'none'; script-src 'none';
+               style-src 'unsafe-inline'; connect-src 'none'; navigate-to 'none'">
+<meta name="referrer" content="no-referrer">
 <style>
 *{{box-sizing:border-box}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;
@@ -51,6 +51,8 @@ th{{background:#f0f0f0;font-weight:600}}
 blockquote{{margin:8px 0;padding:4px 12px;border-left:3px solid #c5c5c5;
             color:#666;background:#fafafa}}
 a{{color:#2980b9;text-decoration:none}} a:hover{{text-decoration:underline}}
+.blocked-image{{display:inline-block;color:#8e6b23;background:#fff9e6;border:1px solid #ead9aa;
+                border-radius:4px;padding:2px 6px;font-size:11px}}
 hr{{border:none;border-top:1px solid #ddd;margin:12px 0}}
 </style></head><body>{body}</body></html>"""
 
@@ -146,17 +148,19 @@ def _codex_cwd_matches(path: str, cwd: str) -> bool:
 
 
 def resume_command(tool: str, cwd: str, session_id: str) -> str:
+    safe_cwd = shlex.quote(cwd)
+    safe_sid = shlex.quote(session_id)
     if tool == "claude":
-        return f"cd {cwd} && claude --resume {session_id}"
+        return f"cd {safe_cwd} && claude --resume {safe_sid}"
     if tool == "codex":
-        return f"cd {cwd} && codex exec resume {session_id} -"
+        return f"cd {safe_cwd} && codex exec resume {safe_sid} -"
     return f"# unknown tool {tool}"
 
 
 # ---------- HTML generation (for WKWebView) ----------
 
 def to_html(tool: str, path: Path) -> str:
-    """Parse session file and return a full HTML document with MathJax support."""
+    """Parse a session file into a self-contained, script-free HTML document."""
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.readlines()
@@ -334,7 +338,7 @@ def _codex_content_to_html(content) -> str:
     return "".join(parts)
 
 
-# ---------- text → HTML with math passthrough ----------
+# ---------- text → offline HTML ----------
 
 _MD = None
 
@@ -344,15 +348,24 @@ def _markdown():
     global _MD
     if _MD is None:
         import mistune
+
+        class _SafeRenderer(mistune.HTMLRenderer):
+            def image(self, text: str, url: str, title: str | None = None) -> str:
+                # 对话内容不可触发任意远程图片请求（隐私信标/内网探测）。
+                label = html.escape(text or "图片")
+                return f'<span class="blocked-image">[已隐藏外部图片：{label}]</span>'
+
         # escape=True：把消息里的原始 HTML 转义掉，只认 markdown 语法
         _MD = mistune.create_markdown(
-            escape=True, plugins=["table", "strikethrough", "math", "url"]
+            escape=True,
+            renderer=_SafeRenderer(escape=True),
+            plugins=["table", "strikethrough", "math", "url"],
         )
     return _MD
 
 
 def _text_to_html(text: str) -> str:
-    """Markdown → HTML（mistune；math 插件输出 \\(..\\)/\\[..\\] 交给 MathJax）。"""
+    """Markdown → HTML（mistune；公式仅保留为离线文本标记）。"""
     try:
         return _markdown()(text)
     except Exception:
@@ -360,7 +373,7 @@ def _text_to_html(text: str) -> str:
 
 
 def _text_to_html_legacy(text: str) -> str:
-    """手写降级渲染（mistune 不可用时）：代码块/行内样式/数学穿透。"""
+    """手写降级渲染（mistune 不可用时）：代码块/行内样式。"""
     lines = text.splitlines()
     out: list[str] = []
     in_code = False
@@ -410,13 +423,15 @@ def _group_paragraphs(lines: list[str]) -> list[list[str]]:
 
 
 def _format_line(line: str) -> str:
-    """Format one line: preserve math delimiters, escape rest, apply inline markdown."""
+    """Format one line while escaping every user-controlled fragment."""
     # Split on display math first ($$...$$), then inline math ($...$)
     parts = re.split(r"(\$\$[^$]*?\$\$|\$(?!\$)[^$\n]*?\$)", line)
     result: list[str] = []
     for p in parts:
         if p.startswith("$"):
-            result.append(p)  # math: pass through for MathJax
+            # 降级路径也必须转义公式内容；过去为 MathJax 原样穿透
+            # 会让 `$<img onerror=...>$` 变成可执行 HTML。
+            result.append(html.escape(p))
         else:
             result.append(_format_inline(p))
     return "".join(result)

@@ -28,7 +28,9 @@ OnResult = Callable[[str, int, str], None]
 
 
 def _sanitized(url: str) -> str:
-    return url.split("?")[0]  # 日志里不落 token
+    # Legacy links used ?token= and current links bootstrap from #token=.
+    # Strip both components before logging so neither form can leak a secret.
+    return url.split("?", 1)[0].split("#", 1)[0]
 
 
 def open_url_async(url: str, on_result: OnResult | None = None) -> bool:

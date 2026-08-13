@@ -1,55 +1,45 @@
 #!/usr/bin/env bash
-# 确定性重启 AgentBar 服务（代码更新后使用）。
-# 不用 `launchctl kickstart -k`：它只杀 job 首进程（uv），agentbar 子进程会变成
-# 孤儿继续占端口，导致新实例反复"已在运行"退出。同时根据
-# runtime.json 精确停止 DMG/AgentBar.app 实例，避免它阻塞源码版接管。
+# Safely restart the source-based AgentBar LaunchAgent.
+# Instance ownership comes from the default state directory's runtime.json;
+# unrelated --state-dir instances are never found or signalled.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=launch-agent-common.sh
+source "$SCRIPT_DIR/launch-agent-common.sh"
+
 LABEL="com.agentbar.app"
+USER_ID="$(id -u)"
+SERVICE_TARGET="gui/$USER_ID/$LABEL"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 RUNTIME="$HOME/.agentbar/runtime.json"
 
-launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-
-# runtime.json 是单实例锁的事实来源。只在命令行明确属于
-# AgentBar 时停止该 PID，避免 stale PID 复用后误杀其他进程。
-runtime_pid=""
-if [[ -f "$RUNTIME" ]]; then
-  runtime_pid=$(/usr/bin/plutil -extract pid raw -o - "$RUNTIME" 2>/dev/null || true)
-fi
-if [[ "$runtime_pid" =~ ^[0-9]+$ ]] && kill -0 "$runtime_pid" 2>/dev/null; then
-  runtime_cmd=$(ps -p "$runtime_pid" -o command= 2>/dev/null || true)
-  case "$runtime_cmd" in
-    *"/bin/agentbar run"*|*"AgentBar.app/Contents/MacOS/AgentBar"*)
-      kill -TERM "$runtime_pid" 2>/dev/null || true
-      ;;
-  esac
-fi
-
-pkill -TERM -f "bin/agentbar run" 2>/dev/null || true
-for _ in $(seq 1 20); do
-  runtime_alive=false
-  if [[ "$runtime_pid" =~ ^[0-9]+$ ]] && kill -0 "$runtime_pid" 2>/dev/null; then
-    runtime_alive=true
-  fi
-  if [[ "$runtime_alive" == false ]] && ! pgrep -f "bin/agentbar run" >/dev/null; then
-    break
-  fi
-  sleep 0.5
-done
-if [[ "$runtime_pid" =~ ^[0-9]+$ ]] && kill -0 "$runtime_pid" 2>/dev/null; then
-  runtime_cmd=$(ps -p "$runtime_pid" -o command= 2>/dev/null || true)
-  case "$runtime_cmd" in
-    *"/bin/agentbar run"*|*"AgentBar.app/Contents/MacOS/AgentBar"*)
-      kill -9 "$runtime_pid" 2>/dev/null || true
-      ;;
-  esac
-fi
-pkill -9 -f "bin/agentbar run" 2>/dev/null || true
-
-if [[ ! -f "$PLIST" ]]; then
-  echo "未安装 LaunchAgent，请先运行 scripts/install-launch-agent.sh" >&2
+if [[ ! -f "$PLIST" || -L "$PLIST" ]]; then
+  echo "错误：未找到可信的 LaunchAgent plist，请先运行 scripts/install-launch-agent.sh" >&2
   exit 1
 fi
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "已重启 $LABEL"
+/usr/bin/plutil -lint "$PLIST" >/dev/null
+
+# Capture the owner before bootout: uv can exit while leaving its AgentBar child
+# alive, and that child is the only extra process this restart may terminate.
+runtime_pid=$(agentbar_runtime_pid "$RUNTIME")
+agentbar_bootout_if_loaded "$SERVICE_TARGET"
+agentbar_stop_runtime_instance "$RUNTIME" 45 "$runtime_pid"
+
+if ! /bin/launchctl bootstrap "gui/$USER_ID" "$PLIST"; then
+  echo "错误：LaunchAgent 加载失败；配置仍保留在 $PLIST" >&2
+  exit 1
+fi
+if ! agentbar_wait_healthy "$RUNTIME" 45; then
+  failed_pid=$(agentbar_runtime_pid "$RUNTIME")
+  if agentbar_bootout_if_loaded "$SERVICE_TARGET" \
+    && agentbar_stop_runtime_instance "$RUNTIME" 45 "$failed_pid"; then
+    echo "错误：AgentBar 在 45 秒内未通过健康检查，已停止异常重启循环" >&2
+  else
+    echo "严重：AgentBar 未通过健康检查，且未能确认异常实例已经停止" >&2
+  fi
+  echo "请查看 $HOME/.agentbar/launchd.stderr.log" >&2
+  exit 1
+fi
+
+echo "已安全重启 $LABEL（仅默认状态目录实例）"

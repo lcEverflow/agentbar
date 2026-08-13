@@ -29,8 +29,10 @@ FINISHED_STATES = {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED}
 
 # 权限档位：readonly=只读, edits=可编辑文件(默认), full=完全权限(必须显式开启)
 PROFILES = ("readonly", "edits", "full")
-# 模型名称不硬编码：CLI 与账号可用模型会持续变化，留空时完全交给 CLI 默认。
-EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# CLI parser only needs the union. Runtime validation remains adapter-specific,
+# so Codex can accept ``minimal`` while Claude can accept ``max`` without the
+# command line maintaining a second, contradictory capability table.
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def new_id() -> str:

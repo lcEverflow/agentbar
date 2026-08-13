@@ -1,12 +1,13 @@
-"""Native MyToken / Tokenverse settings window.
+"""Native quota-source settings window.
 
-The Web panel still exposes the same settings, but this window is the primary
-macOS entry point so users do not need to discover a hidden browser-only page.
-Cookie access only happens after an explicit button click.
+Claude/Codex use manually supplied OAuth access tokens. MyToken/Tokenverse use
+corp browser cookies. Secret fields are always write-only: reopening the window
+shows only whether a credential is configured, never the credential itself.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 
@@ -34,6 +35,7 @@ from .browser_cookies import CookieImportError, import_cookie_header
 from .chrome_login import ChromeCDPLogin, ChromeLoginError
 from .config import (
     DEFAULT_PROVIDERS,
+    DEFAULT_QUOTA_SOURCES,
     PROVIDER_HOSTS,
     PROVIDER_UNITS,
     save_settings,
@@ -41,10 +43,16 @@ from .config import (
 
 log = logging.getLogger("agentbar.provider_window")
 
-W, H = 720, 500
+W, H = 760, 760
 PAD = 18
+_QUOTA_SOURCES = ("claude", "codex")
 _PROVIDERS = ("mytoken", "tokenverse")
-_NAMES = {"mytoken": "MyToken", "tokenverse": "Tokenverse"}
+_NAMES = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "mytoken": "MyToken",
+    "tokenverse": "Tokenverse",
+}
 _TITLE_OPTIONS = (
     ("Claude", "claude"),
     ("Codex", "codex"),
@@ -89,9 +97,17 @@ class ProviderSettingsWindowController(NSObject):
         self._refresh = {}
         self._cookie = {}
         self._status = {}
+        self._source_model = {}
+        self._source_key = {}
+        self._source_account = {}
+        self._source_account_clear = {}
+        self._source_refresh_buttons = {}
         self._import_buttons = {}
         self._chrome_buttons = {}
         self._chrome_logins = {}
+        self._chrome_login_threads = {}
+        self._chrome_login_lock = threading.Lock()
+        self._closing_logins = False
         return self
 
     def show_(self, _sender):
@@ -113,14 +129,14 @@ class ProviderSettingsWindowController(NSObject):
         self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H), mask, NSBackingStoreBuffered, False
         )
-        self.window.setTitle_("AgentBar 内部额度设置")
+        self.window.setTitle_("AgentBar 额度来源设置")
         self.window.setReleasedWhenClosed_(False)
         self.window.center()
         view = self.window.contentView()
 
-        view.addSubview_(_label("内部额度设置", PAD, H - 42, 220, 22, bold=True))
+        view.addSubview_(_label("额度来源设置", PAD, H - 42, 220, 22, bold=True))
         view.addSubview_(_label(
-            "参考 AIUsageBar：点“浏览器登录”，在独立 Chrome 完成 SSO；验证通过后自动保存、刷新并出现在菜单。",
+            "默认关闭周期请求；保存时只刷新有变更的来源，也可单独点“刷新此来源”。",
             PAD, H - 65, W - 2 * PAD, 18, dim=True,
         ))
 
@@ -131,14 +147,91 @@ class ProviderSettingsWindowController(NSObject):
         self.title_popup.addItemsWithTitles_([f"标题：{name}" for name, _ in _TITLE_OPTIONS])
         view.addSubview_(self.title_popup)
 
-        self._build_provider_row(view, "mytoken", H - 250)
-        self._build_provider_row(view, "tokenverse", H - 395)
+        self.auto_refresh_check = NSButton.alloc().initWithFrame_(
+            NSMakeRect(PAD + 290, H - 106, 255, 24)
+        )
+        self.auto_refresh_check.setButtonType_(3)  # NSSwitchButton
+        self.auto_refresh_check.setTitle_("周期自动刷新（默认关闭）")
+        view.addSubview_(self.auto_refresh_check)
+
+        view.addSubview_(_label("订阅额度", PAD, H - 142, 220, 20, bold=True))
+        view.addSubview_(_label(
+            "显式输入 OAuth Access Token；不会读取 Keychain 或 CLI 登录文件。",
+            PAD + 84, H - 142, W - 2 * PAD - 84, 18, dim=True,
+        ))
+        self._build_quota_source_row(view, "claude", H - 235)
+        self._build_quota_source_row(view, "codex", H - 345)
+
+        view.addSubview_(_label("内部额度", PAD, H - 376, 220, 20, bold=True))
+        view.addSubview_(_label(
+            "MyToken / Tokenverse 使用企业 SSO Cookie；浏览器登录和导入都只在显式点击后执行。",
+            PAD + 84, H - 376, W - 2 * PAD - 84, 18, dim=True,
+        ))
+        self._build_provider_row(view, "mytoken", H - 525)
+        self._build_provider_row(view, "tokenverse", H - 670)
 
         self._message = _label("", PAD, 23, W - 200, 20, dim=True)
         view.addSubview_(self._message)
-        save = _button("保存并刷新", W - PAD - 142, 18, 142, self, "onSave:", 30)
+        save = _button("保存配置", W - PAD - 176, 18, 176, self, "onSave:", 30)
         save.setKeyEquivalent_("\r")
         view.addSubview_(save)
+
+    def _build_quota_source_row(self, view, source: str, y: int):
+        name = _NAMES[source]
+        enabled = NSButton.alloc().initWithFrame_(NSMakeRect(PAD, y + 72, 120, 24))
+        enabled.setButtonType_(3)  # NSSwitchButton
+        enabled.setTitle_(name)
+        enabled.setFont_(NSFont.boldSystemFontOfSize_(13))
+        view.addSubview_(enabled)
+        self._enabled[source] = enabled
+
+        status = _label("", PAD + 126, y + 74, W - PAD * 2 - 126, 20, dim=True)
+        view.addSubview_(status)
+        self._status[source] = status
+
+        model_label = "额度模型" if source == "claude" else "metered_feature"
+        view.addSubview_(_label(model_label, PAD, y + 41, 105))
+        model = NSTextField.alloc().initWithFrame_(NSMakeRect(PAD + 108, y + 37, 245, 24))
+        model.setPlaceholderString_(
+            "opus / sonnet；留空=通用窗口"
+            if source == "claude"
+            else "留空=账户总额度；或填 metered_feature"
+        )
+        view.addSubview_(model)
+        self._source_model[source] = model
+
+        if source == "codex":
+            view.addSubview_(_label("Account ID", PAD + 370, y + 41, 78))
+            account = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(PAD + 450, y + 37, W - PAD * 2 - 450 - 82, 24)
+            )
+            account.setPlaceholderString_("可选；留空保留已配置值")
+            view.addSubview_(account)
+            self._source_account[source] = account
+            clear_account = _button(
+                "清 Account", W - PAD - 78, y + 36, 78,
+                self, "onClearAccount:", 26,
+            )
+            clear_account.setRepresentedObject_(source)
+            view.addSubview_(clear_account)
+            self._source_account_clear[source] = clear_account
+
+        view.addSubview_(_label("OAuth Access Token", PAD, y + 9, 126))
+        key = NSSecureTextField.alloc().initWithFrame_(
+            NSMakeRect(PAD + 130, y + 5, W - 2 * PAD - 130 - 174, 24)
+        )
+        key.setPlaceholderString_("留空保留已配置的 Access Token")
+        view.addSubview_(key)
+        self._source_key[source] = key
+
+        refresh = _button("刷新此来源", W - PAD - 166, y + 4, 92, self, "onRefreshSource:", 26)
+        refresh.setRepresentedObject_(source)
+        view.addSubview_(refresh)
+        self._source_refresh_buttons[source] = refresh
+
+        clear = _button("清空", W - PAD - 68, y + 4, 68, self, "onClearSource:", 26)
+        clear.setRepresentedObject_(source)
+        view.addSubview_(clear)
 
     def _build_provider_row(self, view, provider: str, y: int):
         name = _NAMES[provider]
@@ -191,15 +284,59 @@ class ProviderSettingsWindowController(NSObject):
 
     @objc.python_method
     def _reload_controls(self):
+        # Copy one coherent settings revision, then release the lock before
+        # touching AppKit controls. Writers replace/mutate these dictionaries
+        # under the same lock.
+        with self.settings._lock:
+            title_provider = self.settings.title_provider
+            usage_auto_refresh = self.settings.usage_auto_refresh
+            quota_sources = {
+                source: dict((self.settings.quota_sources or {}).get(source) or {})
+                for source in _QUOTA_SOURCES
+            }
+            providers = {
+                provider: dict((self.settings.providers or {}).get(provider) or {})
+                for provider in _PROVIDERS
+            }
         title_values = [value for _, value in _TITLE_OPTIONS]
         try:
-            self.title_popup.selectItemAtIndex_(title_values.index(self.settings.title_provider))
+            self.title_popup.selectItemAtIndex_(title_values.index(title_provider))
         except ValueError:
             self.title_popup.selectItemAtIndex_(1)
 
+        self.auto_refresh_check.setState_(1 if usage_auto_refresh else 0)
+        for source in _QUOTA_SOURCES:
+            defaults = DEFAULT_QUOTA_SOURCES[source]
+            cfg = quota_sources[source] or defaults
+            self._enabled[source].setState_(1 if cfg.get("enabled") else 0)
+            self._source_model[source].setStringValue_(str(cfg.get("model") or ""))
+            # Credentials are write-only. Empty controls mean "keep existing" on save.
+            self._source_key[source].setStringValue_("")
+            account = self._source_account.get(source)
+            if account is not None:
+                account.setStringValue_("")
+            key_set = bool(str(cfg.get("access_token") or "").strip())
+            if key_set:
+                state = "OAuth Access Token 已配置"
+                if source == "codex" and str(cfg.get("account_id") or "").strip():
+                    state += " · Account ID 已配置"
+                if not cfg.get("enabled"):
+                    state += " · 已停用"
+            elif cfg.get("enabled"):
+                state = "已启用，但缺少 OAuth Access Token"
+            else:
+                state = "未配置 OAuth Access Token"
+            self._status[source].setStringValue_(state)
+            self._source_refresh_buttons[source].setEnabled_(
+                bool(cfg.get("enabled") and key_set)
+            )
+            account_clear = self._source_account_clear.get(source)
+            if account_clear is not None:
+                account_clear.setEnabled_(bool(str(cfg.get("account_id") or "").strip()))
+
         for provider in _PROVIDERS:
             defaults = DEFAULT_PROVIDERS[provider]
-            cfg = (self.settings.providers or {}).get(provider) or defaults
+            cfg = providers[provider] or defaults
             self._enabled[provider].setState_(1 if cfg.get("enabled") else 0)
             unit = cfg.get("unit") if cfg.get("unit") in PROVIDER_UNITS else defaults["unit"]
             self._unit[provider].selectItemWithTitle_(unit)
@@ -209,18 +346,105 @@ class ProviderSettingsWindowController(NSObject):
             self._cookie[provider].setStringValue_("")
             cookie = str(cfg.get("cookie") or "")
             if cookie:
-                names = [part.strip().split("=", 1)[0] for part in cookie.split(";") if "=" in part]
-                preview = ", ".join(names[:4]) + (" …" if len(names) > 4 else "")
-                state = f"Cookie 已配置：{preview}"
+                # Cookie is write-only too. Even the text before the first '='
+                # can be a pasted JWT/Bearer value rather than a safe cookie name,
+                # so the native status never echoes any portion of the secret.
+                state = "Cookie 已配置"
             elif cfg.get("enabled"):
                 state = "已启用，但缺少 Cookie"
             else:
                 state = "未配置 Cookie"
             self._status[provider].setStringValue_(state)
 
+    def onRefreshSource_(self, sender):
+        source = str(sender.representedObject() or "")
+        with self.settings._lock:
+            cfg = dict((self.settings.quota_sources or {}).get(source) or {})
+        if source not in _QUOTA_SOURCES or not cfg.get("enabled") or not str(
+            cfg.get("access_token") or ""
+        ).strip():
+            self._message.setStringValue_("请先保存并启用该来源的 OAuth Access Token。")
+            return
+        self.core.quota.refresh_now(source)
+        self._message.setStringValue_(f"{_NAMES[source]}：已触发一次手动额度刷新。")
+
+    def onClearSource_(self, sender):
+        source = str(sender.representedObject() or "")
+        if source not in DEFAULT_QUOTA_SOURCES:
+            return
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(f"清空 {_NAMES[source]} OAuth Access Token？")
+        alert.setInformativeText_("将删除 AgentBar 保存的 Access Token 和 Account ID，并停用该额度来源。")
+        alert.addButtonWithTitle_("清空")
+        alert.addButtonWithTitle_("取消")
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return
+        try:
+            with self.settings._lock:
+                old_sources = copy.deepcopy(self.settings.quota_sources)
+                try:
+                    cfg = self.settings.quota_sources.setdefault(
+                        source, dict(DEFAULT_QUOTA_SOURCES[source])
+                    )
+                    cfg["access_token"] = ""
+                    cfg["account_id"] = ""
+                    cfg["enabled"] = False
+                    save_settings(self.settings)
+                except Exception:
+                    self.settings.quota_sources = old_sources
+                    raise
+        except Exception:
+            log.exception("failed to clear %s quota credential", source)
+            self._reload_controls()
+            self._alert("无法清空额度凭据", "配置文件写入失败，原设置未更改。")
+            return
+        # Clearing disables the source; rebuild without issuing unrelated
+        # requests. There is nothing useful to refresh for the cleared source.
+        self.core.quota.reload_fetchers(refresh=False)
+        self._reload_controls()
+        self._message.setStringValue_(f"{_NAMES[source]} OAuth Access Token 已清空并停用。")
+
+    def onClearAccount_(self, sender):
+        source = str(sender.representedObject() or "")
+        if source != "codex":
+            return
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("清空 Codex Account ID？")
+        alert.setInformativeText_("OAuth Access Token 和额度来源开关保持不变。")
+        alert.addButtonWithTitle_("清空")
+        alert.addButtonWithTitle_("取消")
+        if alert.runModal() != NSAlertFirstButtonReturn:
+            return
+        try:
+            with self.settings._lock:
+                old_sources = copy.deepcopy(self.settings.quota_sources)
+                try:
+                    cfg = self.settings.quota_sources.setdefault(
+                        source, dict(DEFAULT_QUOTA_SOURCES[source])
+                    )
+                    cfg["account_id"] = ""
+                    save_settings(self.settings)
+                    ready = bool(cfg.get("enabled") and cfg.get("access_token"))
+                except Exception:
+                    self.settings.quota_sources = old_sources
+                    raise
+        except Exception:
+            log.exception("failed to clear Codex account id")
+            self._reload_controls()
+            self._alert("Account ID 清空失败", "配置文件写入失败，原设置未更改。")
+            return
+        self.core.quota.reload_fetchers(refresh=False)
+        if ready:
+            self.core.quota.refresh_now(source)
+        self._reload_controls()
+        self._message.setStringValue_("Codex Account ID 已清空；Access Token 保持不变。")
+
     def onChromeLogin_(self, sender):
         provider = str(sender.representedObject() or "")
-        active = self._chrome_logins.get(provider)
+        with self._chrome_login_lock:
+            if self._closing_logins:
+                return
+            active = self._chrome_logins.get(provider)
         if active is not None:
             active.cancel()
             self._status[provider].setStringValue_("正在取消浏览器登录…")
@@ -230,7 +454,6 @@ class ProviderSettingsWindowController(NSObject):
         except ChromeLoginError as exc:
             self._alert("无法启动浏览器登录", str(exc))
             return
-        self._chrome_logins[provider] = login
         sender.setTitle_("取消登录")
         self._status[provider].setStringValue_("正在启动独立 Chrome 登录窗口…")
 
@@ -250,11 +473,52 @@ class ProviderSettingsWindowController(NSObject):
                 error = str(exc)
             AppHelper.callAfter(self._finish_chrome_login, provider, imported, error)
 
-        threading.Thread(
+        worker = threading.Thread(
             target=work,
             name=f"agentbar-chrome-login-{provider}",
             daemon=True,
-        ).start()
+        )
+        # Publish and start atomically with respect to close_active_logins(). A
+        # quit can therefore either miss this attempt entirely (before the click)
+        # or cancel and join a real started thread, never an unstarted object.
+        with self._chrome_login_lock:
+            if self._closing_logins:
+                rejected = True
+            else:
+                rejected = False
+                self._chrome_logins[provider] = login
+                self._chrome_login_threads[provider] = worker
+                worker.start()
+        if rejected:
+            login.cancel()
+            login.close()
+
+    @objc.python_method
+    def close_active_logins(self):
+        """Cancel active SSO windows and synchronously reclaim Chrome/profile data."""
+        with self._chrome_login_lock:
+            self._closing_logins = True
+            active = list(self._chrome_logins.items())
+            threads = dict(self._chrome_login_threads)
+            self._chrome_logins.clear()
+            self._chrome_login_threads.clear()
+        for _provider, login in active:
+            try:
+                login.cancel()
+                login.close()
+            except Exception:
+                log.exception("failed to close active Chrome login")
+        for provider, thread in threads.items():
+            if thread is threading.current_thread():
+                continue
+            try:
+                thread.join(timeout=8)
+                if thread.is_alive():
+                    log.warning("Chrome login worker %s did not stop within 8s", provider)
+            except RuntimeError:
+                # Defensive for injected/test workers; production threads are
+                # started before publication under _chrome_login_lock.
+                pass
 
     @objc.python_method
     def _set_provider_status(self, provider, message):
@@ -262,7 +526,15 @@ class ProviderSettingsWindowController(NSObject):
 
     @objc.python_method
     def _finish_chrome_login(self, provider, imported, error):
-        self._chrome_logins.pop(provider, None)
+        with self._chrome_login_lock:
+            self._chrome_logins.pop(provider, None)
+            self._chrome_login_threads.pop(provider, None)
+            closing = self._closing_logins
+        # A worker may queue this callback just before shutdown cancels it.
+        # Once close_active_logins() has linearized, never touch AppKit controls
+        # or persist a late credential from the retired login attempt.
+        if closing:
+            return
         self._chrome_buttons[provider].setTitle_("🌐 浏览器登录")
         if error or imported is None:
             message = error or "未捕获到 Cookie"
@@ -311,40 +583,196 @@ class ProviderSettingsWindowController(NSObject):
 
     @objc.python_method
     def _save_imported_cookie(self, provider, imported):
-        cfg = self.settings.providers.setdefault(provider, dict(DEFAULT_PROVIDERS[provider]))
-        cfg["enabled"] = True
-        cfg["cookie"] = imported.header
-        save_settings(self.settings)
-        self.core.quota.reload_fetchers()
+        try:
+            with self.settings._lock:
+                old_providers = copy.deepcopy(self.settings.providers)
+                try:
+                    cfg = self.settings.providers.setdefault(
+                        provider, dict(DEFAULT_PROVIDERS[provider])
+                    )
+                    cfg["enabled"] = True
+                    cfg["cookie"] = imported.header
+                    save_settings(self.settings)
+                except Exception:
+                    self.settings.providers = old_providers
+                    raise
+        except Exception:
+            log.exception("failed to save imported %s cookie", provider)
+            self._reload_controls()
+            self._alert("Cookie 保存失败", "配置文件写入失败，原设置未更改。")
+            return
+        self.core.quota.reload_fetchers(refresh=False)
+        self.core.quota.refresh_now(provider)
         self._reload_controls()
         self._message.setStringValue_(
             f"{_NAMES[provider]}：已从 {imported.source} 导入 {imported.count} 个 Cookie，并触发刷新"
         )
 
     def onSave_(self, _sender):
-        for provider in _PROVIDERS:
-            defaults = DEFAULT_PROVIDERS[provider]
-            cfg = self.settings.providers.setdefault(provider, dict(defaults))
-            cfg["enabled"] = bool(self._enabled[provider].state())
-            unit = str(self._unit[provider].titleOfSelectedItem() or defaults["unit"])
-            cfg["unit"] = unit if unit in PROVIDER_UNITS else defaults["unit"]
-            try:
-                cfg["refresh_seconds"] = max(
-                    60, int(str(self._refresh[provider].stringValue()).strip() or 300)
+        # Read and validate control values before taking the settings lock; AppKit
+        # calls must never sit inside a cross-thread configuration transaction.
+        source_inputs = {}
+        provider_inputs = {}
+        try:
+            for source in _QUOTA_SOURCES:
+                enabled = bool(self._enabled[source].state())
+                model = self._validated_field(
+                    self._source_model[source], "额度模型", 160
                 )
-            except ValueError:
-                cfg["refresh_seconds"] = defaults["refresh_seconds"]
-            cookie = str(self._cookie[provider].stringValue()).strip()
-            if cookie:
-                cfg["cookie"] = cookie
+                typed_key = self._validated_field(
+                    self._source_key[source], "OAuth Access Token", 16_384
+                )
+                account = ""
+                if source == "codex":
+                    account = self._validated_field(
+                        self._source_account[source], "Codex Account ID", 256
+                    )
+                source_inputs[source] = {
+                    "enabled": enabled,
+                    "model": model,
+                    "typed_key": typed_key,
+                    "account_id": account,
+                }
+            for provider in _PROVIDERS:
+                defaults = DEFAULT_PROVIDERS[provider]
+                unit = str(
+                    self._unit[provider].titleOfSelectedItem() or defaults["unit"]
+                )
+                try:
+                    refresh_seconds = max(
+                        60,
+                        int(str(self._refresh[provider].stringValue()).strip() or 300),
+                    )
+                except ValueError:
+                    refresh_seconds = defaults["refresh_seconds"]
+                provider_inputs[provider] = {
+                    "enabled": bool(self._enabled[provider].state()),
+                    "unit": unit if unit in PROVIDER_UNITS else defaults["unit"],
+                    "refresh_seconds": refresh_seconds,
+                    "cookie": str(self._cookie[provider].stringValue()).strip(),
+                }
+        except ValueError as exc:
+            self._alert("无法保存额度设置", str(exc))
+            return
 
         title_index = self.title_popup.indexOfSelectedItem()
-        if 0 <= title_index < len(_TITLE_OPTIONS):
-            self.settings.title_provider = _TITLE_OPTIONS[title_index][1]
-        save_settings(self.settings)
-        self.core.quota.reload_fetchers()
+        selected_title = (
+            _TITLE_OPTIONS[title_index][1]
+            if 0 <= title_index < len(_TITLE_OPTIONS)
+            else None
+        )
+        selected_auto_refresh = bool(self.auto_refresh_check.state())
+
+        try:
+            # One settings transaction covers credential preservation, mutation,
+            # persistence and change detection. A concurrent Web PATCH can run
+            # wholly before or after this transaction, never interleave with it.
+            with self.settings._lock:
+                old_sources = copy.deepcopy(self.settings.quota_sources)
+                old_providers = copy.deepcopy(self.settings.providers)
+                old_title = self.settings.title_provider
+                old_auto_refresh = self.settings.usage_auto_refresh
+                before_sources = {
+                    source: dict((old_sources or {}).get(source) or {})
+                    for source in _QUOTA_SOURCES
+                }
+                before_providers = {
+                    provider: dict((old_providers or {}).get(provider) or {})
+                    for provider in _PROVIDERS
+                }
+                try:
+                    for source, update in source_inputs.items():
+                        current = (self.settings.quota_sources or {}).get(source) or {}
+                        effective_key = update["typed_key"] or str(
+                            current.get("access_token") or ""
+                        ).strip()
+                        if update["enabled"] and not effective_key:
+                            raise ValueError(
+                                f"{_NAMES[source]} 启用前必须输入 OAuth Access Token"
+                            )
+
+                    for source, update in source_inputs.items():
+                        cfg = self.settings.quota_sources.setdefault(
+                            source, dict(DEFAULT_QUOTA_SOURCES[source])
+                        )
+                        cfg["enabled"] = update["enabled"]
+                        cfg["model"] = update["model"]
+                        # Empty credential controls preserve the saved write-only value.
+                        if update["typed_key"]:
+                            cfg["access_token"] = update["typed_key"]
+                        if source == "codex" and update["account_id"]:
+                            cfg["account_id"] = update["account_id"]
+
+                    for provider, update in provider_inputs.items():
+                        cfg = self.settings.providers.setdefault(
+                            provider, dict(DEFAULT_PROVIDERS[provider])
+                        )
+                        cfg["enabled"] = update["enabled"]
+                        cfg["unit"] = update["unit"]
+                        cfg["refresh_seconds"] = update["refresh_seconds"]
+                        if update["cookie"]:
+                            cfg["cookie"] = update["cookie"]
+
+                    if selected_title is not None:
+                        self.settings.title_provider = selected_title
+                    self.settings.usage_auto_refresh = selected_auto_refresh
+                    save_settings(self.settings)
+                except Exception:
+                    self.settings.quota_sources = old_sources
+                    self.settings.providers = old_providers
+                    self.settings.title_provider = old_title
+                    self.settings.usage_auto_refresh = old_auto_refresh
+                    raise
+
+                changed = [
+                    source for source in _QUOTA_SOURCES
+                    if before_sources[source]
+                    != dict((self.settings.quota_sources or {}).get(source) or {})
+                ]
+                changed.extend(
+                    provider for provider in _PROVIDERS
+                    if before_providers[provider]
+                    != dict((self.settings.providers or {}).get(provider) or {})
+                )
+                ready_tools = []
+                for tool in changed:
+                    if tool in _QUOTA_SOURCES:
+                        cfg = (self.settings.quota_sources or {}).get(tool) or {}
+                        ready = cfg.get("enabled") and str(
+                            cfg.get("access_token") or ""
+                        ).strip()
+                    else:
+                        cfg = (self.settings.providers or {}).get(tool) or {}
+                        ready = cfg.get("enabled") and str(
+                            cfg.get("cookie") or ""
+                        ).strip()
+                    if ready:
+                        ready_tools.append(tool)
+                auto_refresh_enabled = self.settings.usage_auto_refresh
+                auto_refresh_changed = old_auto_refresh != auto_refresh_enabled
+        except ValueError as exc:
+            self._alert("无法保存额度设置", str(exc))
+            return
+        except Exception:
+            log.exception("failed to save quota settings")
+            self._reload_controls()
+            self._alert("无法保存额度设置", "配置文件写入失败，原设置未更改。")
+            return
+
+        refreshed = []
+        if changed or auto_refresh_changed:
+            self.core.quota.reload_fetchers(refresh=False)
+        if changed:
+            for tool in ready_tools:
+                self.core.quota.refresh_now(tool)
+                refreshed.append(_NAMES[tool])
         self._reload_controls()
-        self._message.setStringValue_("配置已保存；额度刷新已触发，稍后可在菜单中查看。")
+        mode = "已开启周期自动刷新" if auto_refresh_enabled else "之后仅手动刷新"
+        refresh_note = (
+            f"已刷新变更来源：{'、'.join(refreshed)}"
+            if refreshed else "没有来源需要刷新"
+        )
+        self._message.setStringValue_(f"配置已保存；{refresh_note}；{mode}。")
 
     def onClear_(self, sender):
         provider = str(sender.representedObject() or "")
@@ -357,13 +785,36 @@ class ProviderSettingsWindowController(NSObject):
         alert.addButtonWithTitle_("取消")
         if alert.runModal() != NSAlertFirstButtonReturn:
             return
-        cfg = self.settings.providers.setdefault(provider, dict(DEFAULT_PROVIDERS[provider]))
-        cfg["cookie"] = ""
-        cfg["enabled"] = False
-        save_settings(self.settings)
-        self.core.quota.reload_fetchers()
+        try:
+            with self.settings._lock:
+                old_providers = copy.deepcopy(self.settings.providers)
+                try:
+                    cfg = self.settings.providers.setdefault(
+                        provider, dict(DEFAULT_PROVIDERS[provider])
+                    )
+                    cfg["cookie"] = ""
+                    cfg["enabled"] = False
+                    save_settings(self.settings)
+                except Exception:
+                    self.settings.providers = old_providers
+                    raise
+        except Exception:
+            log.exception("failed to clear %s cookie", provider)
+            self._reload_controls()
+            self._alert("无法清空 Cookie", "配置文件写入失败，原设置未更改。")
+            return
+        self.core.quota.reload_fetchers(refresh=False)
         self._reload_controls()
         self._message.setStringValue_(f"{_NAMES[provider]} Cookie 已清空并停用。")
+
+    @objc.python_method
+    def _validated_field(self, control, label, max_len):
+        value = str(control.stringValue() or "").strip()
+        if len(value) > max_len:
+            raise ValueError(f"{label} 过长")
+        if any(char in value for char in "\r\n\x00"):
+            raise ValueError(f"{label} 不能包含换行或 NUL")
+        return value
 
     @objc.python_method
     def _alert(self, title, text):

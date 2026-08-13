@@ -26,8 +26,12 @@ def _wait_for(pred, timeout=3.0):
 
 def test_open_url_async_returns_fast(monkeypatch):
     calls = {}
-    monkeypatch.setattr(subprocess, "Popen",
-                        lambda argv, **kw: calls.setdefault("argv", argv) or _FakeProc())
+
+    def fake_popen(argv, **_kwargs):
+        calls["argv"] = argv
+        return _FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     start = time.monotonic()
     ok = browser.open_url_async("http://127.0.0.1:8737/?token=x")
     assert ok is True
@@ -84,3 +88,8 @@ def test_blocking_variant_falls_back_to_webbrowser(monkeypatch):
                         lambda url, new=0: called.setdefault("url", url) or True)
     assert browser.open_panel_url("http://x/") is True
     assert called["url"] == "http://x/"
+
+
+def test_sanitized_url_removes_query_and_fragment_tokens():
+    assert browser._sanitized("http://127.0.0.1:8737/?token=old") == "http://127.0.0.1:8737/"
+    assert browser._sanitized("http://127.0.0.1:8737/?tool=codex#token=new") == "http://127.0.0.1:8737/"

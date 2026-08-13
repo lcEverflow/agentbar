@@ -1,6 +1,6 @@
 [project]
 name = "agentbar"
-version = "0.10.3"
+version = "0.10.4"
 description = "macOS menu bar scheduler for AI CLI agents (Claude Code, Codex, ...)"
 requires-python = ">=3.11"
 dependencies = [
@@ -8,9 +8,7 @@ dependencies = [
     # 原生 AppKit 菜单栏（NSStatusItem/NSMenu）。rumps 已移除：其定时重建
     # 打开中菜单 + 主线程阻塞模式在 macOS 26 上造成菜单卡死/点击失效。
     "pyobjc-framework-Cocoa>=11.0; sys_platform == 'darwin'",
-    # Claude Code OAuth 凭据存于 macOS 登录 Keychain，需要 Security 框架。
-    "pyobjc-framework-Security>=11.0; sys_platform == 'darwin'",
-    "pyobjc-framework-webkit>=12.2.1",
+    "pyobjc-framework-webkit>=12.2.1; sys_platform == 'darwin'",
     "qrcode>=8.2",
     # 企业 SSO 原生配置：用真实 Chrome + CDP 捕获并验证 MyToken/Tokenverse Cookie。
     "websocket-client>=1.8",

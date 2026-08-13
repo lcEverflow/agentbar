@@ -12,10 +12,11 @@ import threading
 import time
 from pathlib import Path
 
-_CACHE_SECONDS = 3.0
+_CACHE_SECONDS = 5.0
 _cache_lock = threading.Lock()
 _cache_at = 0.0
 _cache_processes: dict[int, dict] = {}
+_scan_inflight = False
 
 
 def _tool_for_executable(executable: str) -> str | None:
@@ -58,14 +59,40 @@ def _scan_processes() -> dict[int, dict]:
     return rows
 
 
+def _refresh_cache() -> None:
+    global _cache_at, _cache_processes, _scan_inflight
+    try:
+        scanned = _scan_processes()
+        completed_at = time.monotonic()
+        with _cache_lock:
+            _cache_processes = scanned
+            _cache_at = completed_at
+    finally:
+        with _cache_lock:
+            _scan_inflight = False
+
+
 def _processes() -> dict[int, dict]:
-    global _cache_at, _cache_processes
+    """Return cached metadata immediately and refresh it on one background worker."""
+    global _scan_inflight
     now = time.monotonic()
+    worker = None
     with _cache_lock:
-        if now - _cache_at >= _CACHE_SECONDS:
-            _cache_processes = _scan_processes()
-            _cache_at = now
-        return dict(_cache_processes)
+        if now - _cache_at >= _CACHE_SECONDS and not _scan_inflight:
+            _scan_inflight = True
+            worker = threading.Thread(
+                target=_refresh_cache,
+                name="agentbar-process-scan",
+                daemon=True,
+            )
+        cached = dict(_cache_processes)
+    if worker is not None:
+        try:
+            worker.start()
+        except Exception:
+            with _cache_lock:
+                _scan_inflight = False
+    return cached
 
 
 def _owner_for(pid: int, rows: dict[int, dict], owned: dict[int, dict]) -> dict | None:

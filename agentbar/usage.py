@@ -1,16 +1,12 @@
 """Real quota/usage fetchers — approach mirrored from ylab/aiusagebar (Swift).
 
 Claude:  GET https://api.anthropic.com/api/oauth/usage
-         凭据链: env CLAUDE_CODE_OAUTH_TOKEN → 本地缓存 ~/.agentbar/claude_credentials.json
-                → ~/.claude/.credentials.json
-                → macOS Keychain "Claude Code-credentials"（只缓存短期 access token；
-                  refresh token 仍由 Claude Code 独占续期，避免竞态与反复弹窗）
+         AgentBar 运行时只使用用户在额度设置中显式保存的 OAuth Access Token；
          响应: {five_hour|seven_day|seven_day_opus|seven_day_sonnet:
                 {utilization: 0-100, resets_at: ISO8601}}
 
 Codex:   GET https://chatgpt.com/backend-api/wham/usage
-         凭据: $CODEX_HOME/auth.json（默认 ~/.codex/auth.json）tokens.access_token
-               + chatgpt-account-id（tokens.account_id 或 JWT claim）
+         AgentBar 运行时使用显式保存的 OAuth Access Token，以及可选 Account ID；
          响应: {rate_limits: {primary|secondary:
                 {used_percent: 0-100, resets_at: epoch_s, window_duration_mins}}}
 
@@ -22,13 +18,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
+import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 
 log = logging.getLogger("agentbar.usage")
 
@@ -44,12 +39,17 @@ class UsageWindow:
     used: float | None = None       # 已用（credits 或 token 数）
     total: float | None = None      # 总额度
     unit: str | None = None         # "credits" | "percent" | "token"
+    # None 表示账户级通用窗口；有值时只限对应模型家族/额度桶。
+    model: str | None = None
+    limited: bool = False
 
     def to_dict(self) -> dict:
         return {
             "label": self.label,
             "used_percent": round(self.used_percent, 1),
             "resets_at": self.resets_at,
+            "model": self.model,
+            "limited": self.limited,
             "used": self.used,
             "total": self.total,
             "unit": self.unit,
@@ -65,6 +65,8 @@ class UsageSnapshot:
     fetched_at: float = field(default_factory=time.time)
     error: str | None = None
     limited: bool = False
+    model: str | None = None
+    available_models: list[str] = field(default_factory=list)
 
     @property
     def primary(self) -> UsageWindow | None:
@@ -79,6 +81,8 @@ class UsageSnapshot:
             "fetched_at": self.fetched_at,
             "error": self.error,
             "limited": self.limited,
+            "model": self.model,
+            "available_models": self.available_models,
         }
 
 
@@ -103,102 +107,13 @@ def _jwt_payload(token: str) -> dict:
     try:
         part = token.split(".")[1]
         part += "=" * (-len(part) % 4)
-        return json.loads(base64.urlsafe_b64decode(part))
+        payload = json.loads(base64.urlsafe_b64decode(part))
+        return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
 
 
 # ================= Claude =================
-
-KEYCHAIN_SERVICE = "Claude Code-credentials"
-
-# 本地凭据缓存：Keychain 成功读到一次后写回这里（0600）。只保存
-# 短期 access token 和“已授权”标记，故意不保存/使用 refresh token：
-# Claude Code 的 refresh token 会轮换，多进程独立续期可能导致登录态失效。
-CLAUDE_CRED_CACHE = Path.home() / ".agentbar" / "claude_credentials.json"
-
-
-def _cache_read_credentials() -> dict | None:
-    """读取本地凭据缓存；过期凭据也保留，用于记录授权状态。"""
-    try:
-        creds = json.loads(CLAUDE_CRED_CACHE.read_bytes())
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(creds, dict):
-        return None
-    if not (creds.get("token") or "").strip():
-        return None
-    return creds
-
-
-def _cache_write_credentials(creds: dict) -> None:
-    """把凭据写入本地缓存文件（0600 权限，仅当前用户可读）。"""
-    try:
-        CLAUDE_CRED_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CLAUDE_CRED_CACHE.with_suffix(".tmp")
-        # 允许列表会把旧版缓存里的 refresh_token 一并清理掉。
-        safe = {
-            key: creds.get(key)
-            for key in ("token", "expires_at", "plan", "scopes", "keychain_authorized")
-            if creds.get(key) is not None
-        }
-        tmp.write_text(json.dumps(safe), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, CLAUDE_CRED_CACHE)
-    except OSError:
-        log.warning("写入 Claude 凭据缓存失败: %s", CLAUDE_CRED_CACHE, exc_info=True)
-
-
-def _keychain_read(interactive: bool = False) -> bytes | None:
-    """静默读取 Keychain（interactive=True 允许系统弹窗授权，仅由用户显式触发）。"""
-    try:
-        import Security  # pyobjc-framework-Security
-    except ImportError:
-        return None
-    query = {
-        Security.kSecClass: Security.kSecClassGenericPassword,
-        Security.kSecAttrService: KEYCHAIN_SERVICE,
-        Security.kSecMatchLimit: Security.kSecMatchLimitOne,
-        Security.kSecReturnData: True,
-        Security.kSecUseAuthenticationUI: (
-            Security.kSecUseAuthenticationUIAllow
-            if interactive
-            else Security.kSecUseAuthenticationUIFail
-        ),
-    }
-    status, data = Security.SecItemCopyMatching(query, None)
-    if status != 0 or data is None:
-        return None
-    return bytes(data)
-
-
-def _parse_claude_credentials(raw: bytes) -> dict | None:
-    try:
-        oauth = json.loads(raw.decode("utf-8")).get("claudeAiOauth") or {}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    token = (oauth.get("accessToken") or "").strip()
-    if not token:
-        return None
-    expires_ms = oauth.get("expiresAt")
-    return {
-        "token": token,
-        "expires_at": (expires_ms / 1000.0) if expires_ms else None,
-        "plan": oauth.get("subscriptionType") or oauth.get("rateLimitTier"),
-        "scopes": oauth.get("scopes"),
-        "keychain_authorized": True,
-    }
-
-
-def _credentials_expired(creds: dict) -> bool:
-    """凭据的 access token 是否已过期。"""
-    exp = creds.get("expires_at")
-    if not exp:
-        return False
-    try:
-        return float(exp) <= time.time()
-    except (TypeError, ValueError):
-        return True
 
 
 class ClaudeUsageFetcher:
@@ -211,53 +126,21 @@ class ClaudeUsageFetcher:
         ("seven_day_sonnet", "7d Sonnet"),
     ]
 
-    def load_credentials(self, interactive: bool = False) -> dict | None:
-        for env_key in ("CLAUDE_CODE_OAUTH_TOKEN", "CODEXBAR_CLAUDE_OAUTH_TOKEN"):
-            token = (os.environ.get(env_key) or "").strip()
-            if token:
-                return {"token": token, "expires_at": None, "plan": None}
-        # 本地缓存未过期时直接使用，完全不碰 Keychain。
-        cached = _cache_read_credentials()
-        if cached and not _credentials_expired(cached):
-            return cached
-        cred_file = Path.home() / ".claude" / ".credentials.json"
-        if cred_file.exists():
-            try:
-                creds = _parse_claude_credentials(cred_file.read_bytes())
-            except OSError:
-                creds = None
-            if creds and not _credentials_expired(creds):
-                _cache_write_credentials(creds)
-                return creds
-        # access token 过期后只做静默同步（UIFail）。Claude Code 自己运行
-        # 时会按其内置锁与 Keychain 写回机制续期，AgentBar 不参与轮换。
-        raw = _keychain_read(interactive=interactive)
-        if raw:
-            creds = _parse_claude_credentials(raw)
-            if creds:
-                _cache_write_credentials(creds)
-                return creds
-        # 已经授权过的旧缓存保留为状态信号：不再误报“需要授权”。
-        return cached if cached and cached.get("keychain_authorized") else None
+    def __init__(self, access_token: str = "", model: str = ""):
+        self.access_token = (access_token or "").strip()
+        self.model = (model or "").strip()
+
+    def load_credentials(self) -> dict | None:
+        if not self.access_token:
+            return None
+        return {"token": self.access_token, "plan": None}
 
     def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
-        creds = self.load_credentials(interactive=interactive)
+        creds = self.load_credentials()
         if not creds:
             return UsageSnapshot(
                 self.tool, source="oauth_api",
-                error=("未读到可用的 Claude 凭据（只需手动授权 Keychain 一次，"
-                       "后续静默同步）"),
-            )
-        if _credentials_expired(creds):
-            if creds.get("keychain_authorized"):
-                return UsageSnapshot(
-                    self.tool, source="oauth_api",
-                    error=("Claude access token 已过期；Claude Code 下次运行时会安全续期，"
-                           "AgentBar 将静默同步"),
-                )
-            return UsageSnapshot(
-                self.tool, source="oauth_api",
-                error="Claude OAuth 凭据已过期，请运行 claude 重新登录",
+                error="未配置 Claude OAuth Access Token",
             )
         headers = {
             "Authorization": f"Bearer {creds['token']}",
@@ -277,7 +160,17 @@ class ClaudeUsageFetcher:
 
     def parse(self, data: dict, plan: str | None = None) -> UsageSnapshot:
         windows = []
+        selected = self.model.casefold()
+        selected_family = (
+            "opus" if "opus" in selected else "sonnet" if "sonnet" in selected else ""
+        )
         for key, label in self._WINDOW_KEYS:
+            # 选中 Opus/Sonnet 时，保留账户通用窗口，只隐藏另一个
+            # 模型家族的专属周窗口。其他模型仍展示账户通用额度。
+            if key.startswith("seven_day_") and (
+                not selected_family or not key.endswith(selected_family)
+            ):
+                continue
             w = data.get(key)
             if not isinstance(w, dict) or w.get("utilization") is None:
                 continue
@@ -285,8 +178,16 @@ class ClaudeUsageFetcher:
                 label=label,
                 used_percent=max(0.0, min(100.0, float(w["utilization"]))),
                 resets_at=_parse_iso(w.get("resets_at")),
+                model=selected_family if key.startswith("seven_day_") else None,
             ))
-        snap = UsageSnapshot(self.tool, windows=windows, plan=plan, source="oauth_api")
+        snap = UsageSnapshot(
+            self.tool,
+            windows=windows,
+            plan=plan,
+            source="oauth_api",
+            model=self.model or None,
+            available_models=["opus", "sonnet"],
+        )
         if not windows:
             snap.error = "usage 接口未返回可识别的额度窗口"
         return snap
@@ -299,46 +200,30 @@ class CodexUsageFetcher:
     tool = "codex"
     URL = "https://chatgpt.com/backend-api/wham/usage"
 
-    @staticmethod
-    def _auth_path() -> Path:
-        home = (os.environ.get("CODEX_HOME") or "").strip()
-        base = Path(home).expanduser() if home else Path.home() / ".codex"
-        return base / "auth.json"
+    def __init__(self, access_token: str = "", account_id: str = "", model: str = ""):
+        self.access_token = (access_token or "").strip()
+        self.account_id = (account_id or "").strip()
+        self.model = (model or "").strip()
 
     def load_credentials(self) -> dict | None:
-        p = self._auth_path()
-        if not p.exists():
+        if not self.access_token:
             return None
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return None
-        tokens = data.get("tokens") or data
-        token = (tokens.get("access_token") or tokens.get("accessToken") or "").strip()
-        if not token:
-            return None
-        id_token = tokens.get("id_token") or ""
-        id_payload = _jwt_payload(id_token)
-        access_payload = _jwt_payload(token)
-        auth_claim = (
-            id_payload.get("https://api.openai.com/auth")
-            or access_payload.get("https://api.openai.com/auth")
-            or {}
-        )
+        access_payload = _jwt_payload(self.access_token)
+        auth_claim = access_payload.get("https://api.openai.com/auth") or {}
         account_id = (
-            tokens.get("account_id")
+            self.account_id
             or auth_claim.get("chatgpt_account_id")
             or access_payload.get("chatgpt_account_id")
             or access_payload.get("account_id")
         )
         plan = auth_claim.get("chatgpt_plan_type") or access_payload.get("chatgpt_plan_type")
-        return {"token": token, "account_id": account_id, "plan": plan}
+        return {"token": self.access_token, "account_id": account_id, "plan": plan}
 
     def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
         creds = self.load_credentials()
         if not creds:
             return UsageSnapshot(self.tool, source="wham_api",
-                                 error="未读到 ~/.codex/auth.json（先运行 codex login）")
+                                 error="未配置 Codex OAuth Access Token")
         headers = {
             "Authorization": f"Bearer {creds['token']}",
             "Accept": "*/*",
@@ -358,14 +243,18 @@ class CodexUsageFetcher:
             return UsageSnapshot(self.tool, source="wham_api", error=f"网络错误: {e}")
         return self.parse(data, plan=creds.get("plan"))
 
-    def parse(self, data: dict, plan: str | None = None) -> UsageSnapshot:
-        """Parse both observed WHAM response shapes.
+    @staticmethod
+    def _model_key(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
 
-        Older clients expose ``rate_limits.primary`` with minute windows, while
-        the current ChatGPT-backed response exposes ``rate_limit.primary_window``
-        with second windows and a ``limit_reached`` boolean.
-        """
-        limits = data.get("rate_limits") or data.get("rate_limit") or {}
+    @staticmethod
+    def _windows(
+        limits: dict,
+        *,
+        model: str | None = None,
+        limited: bool = False,
+        label_prefix: str = "",
+    ) -> list[UsageWindow]:
         windows = []
         for keys, fallback_label in (
             (("primary", "primary_window"), "5h"),
@@ -384,20 +273,103 @@ class CodexUsageFetcher:
                 label = f"{round(mins / 60)}h" if mins < 2880 else f"{round(mins / 1440)}d"
             elif seconds:
                 label = f"{round(seconds / 3600)}h" if seconds < 2880 * 60 else f"{round(seconds / 86400)}d"
-            reset = w.get("resets_at", w.get("resetsAt"))
+            reset = w.get(
+                "resets_at",
+                w.get("resetsAt", w.get("reset_at", w.get("resetAt"))),
+            )
             if not reset and w.get("reset_after_seconds"):
                 reset = time.time() + float(w["reset_after_seconds"])
             windows.append(UsageWindow(
-                label=label,
+                label=f"{label_prefix}{label}",
                 used_percent=max(0.0, min(100.0, float(used))),
                 resets_at=float(reset) if reset else None,
+                model=model,
+                limited=limited,
             ))
+        return windows
+
+    @staticmethod
+    def _limited(limits: dict) -> bool:
+        return (
+            bool(limits.get("limit_reached", limits.get("limitReached")))
+            or limits.get("allowed") is False
+        )
+
+    def parse(self, data: dict, plan: str | None = None) -> UsageSnapshot:
+        """Parse both observed WHAM response shapes.
+
+        Older clients expose ``rate_limits.primary`` with minute windows, while
+        the current ChatGPT-backed response exposes ``rate_limit.primary_window``
+        with second windows and a ``limit_reached`` boolean.
+        """
+        additional = [
+            item for item in (data.get("additional_rate_limits") or [])
+            if isinstance(item, dict)
+        ]
+        # Persist/select the stable metered_feature whenever the endpoint exposes
+        # one. limit_name is presentation text and can be renamed independently.
+        available = [
+            str(item.get("metered_feature") or item.get("limit_name") or "").strip()
+            for item in additional
+        ]
+        available = [name for name in available if name]
+        selected_item = None
+        if self.model:
+            wanted = self._model_key(self.model)
+            for item in additional:
+                names = (str(item.get("limit_name") or ""), str(item.get("metered_feature") or ""))
+                if wanted and wanted in {self._model_key(name) for name in names}:
+                    selected_item = item
+                    break
+            if selected_item is None:
+                choices = "、".join(available[:6]) or "暂无模型专属额度"
+                return UsageSnapshot(
+                    self.tool,
+                    plan=plan or data.get("plan_type"),
+                    source="wham_api",
+                    error=f"未找到模型额度 {self.model!r}；接口可用：{choices}",
+                    model=self.model,
+                    available_models=available,
+                )
+
+        account_limits = data.get("rate_limits") or data.get("rate_limit") or {}
+        account_limited = self._limited(account_limits)
+        selected_label = (
+            str(
+                selected_item.get("limit_name")
+                or selected_item.get("metered_feature")
+                or self.model
+            )
+            if selected_item is not None
+            else (self.model or None)
+        )
+        if selected_item is not None:
+            selected_limits = selected_item.get("rate_limit") or {}
+            selected_limited = self._limited(selected_limits)
+            windows = self._windows(
+                account_limits,
+                limited=account_limited,
+                label_prefix="账户 ",
+            )
+            windows.extend(self._windows(
+                selected_limits,
+                model=selected_label,
+                limited=selected_limited,
+                label_prefix=f"{selected_label} ",
+            ))
+        else:
+            selected_limited = False
+            windows = self._windows(account_limits, limited=account_limited)
         snap = UsageSnapshot(
             self.tool,
             windows=windows,
             plan=plan or data.get("plan_type"),
             source="wham_api",
-            limited=bool(limits.get("limit_reached")),
+            # 保留 snapshot 级标记给旧 UI；调度决策应按 window.model
+            # 逐窗口判断，避免模型专属限额污染账户级窗口。
+            limited=account_limited or selected_limited,
+            model=selected_label,
+            available_models=available,
         )
         if not windows:
             snap.error = "usage 接口未返回 rate_limits"
@@ -489,7 +461,6 @@ class MyTokenUsageFetcher:
         return name
 
     def _monthly_tokens(self, username: str) -> float | None:
-        start = _next_month_start() - 1  # 仅用于本月窗口，取月初到现在
         month_start_ms = int(time.mktime(time.strptime(_month_start_str(), "%Y-%m-%d")) * 1000)
         now_ms = int(time.time() * 1000)
         url = (f"{self.BASE}/api/v1/billing/usage/token-summary"
@@ -597,11 +568,27 @@ _CORP_FETCHERS = {
 
 
 def get_usage_fetchers(settings=None) -> dict[str, object]:
-    """内置 claude/codex，外加 config 里 enabled 且已配 cookie 的 corp provider。"""
-    fetchers: dict[str, object] = {
-        "claude": ClaudeUsageFetcher(),
-        "codex": CodexUsageFetcher(),
-    }
+    """只创建用户显式启用且已配凭据的额度来源。
+
+    没有 Settings 也不创建隐式来源，确保任何调用路径都不会读取 CLI
+    登录文件或系统凭据存储。
+    """
+    fetchers: dict[str, object] = {}
+    if settings is not None:
+        sources = getattr(settings, "quota_sources", None) or {}
+        claude = sources.get("claude") or {}
+        if claude.get("enabled") and (claude.get("access_token") or "").strip():
+            fetchers["claude"] = ClaudeUsageFetcher(
+                access_token=claude.get("access_token", ""),
+                model=claude.get("model", ""),
+            )
+        codex = sources.get("codex") or {}
+        if codex.get("enabled") and (codex.get("access_token") or "").strip():
+            fetchers["codex"] = CodexUsageFetcher(
+                access_token=codex.get("access_token", ""),
+                account_id=codex.get("account_id", ""),
+                model=codex.get("model", ""),
+            )
     providers = getattr(settings, "providers", None) or {}
     for name, cls in _CORP_FETCHERS.items():
         cfg = providers.get(name) or {}

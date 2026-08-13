@@ -113,22 +113,52 @@ class ChromeCDPLogin:
         # 会在 finally 里完成回收，避免“取消登录”按钮卡住菜单栏。
         process = self._process
         if process and process.poll() is None:
-            process.terminate()
+            try:
+                process.terminate()
+            except OSError:
+                pass
 
     def close(self) -> None:
         process = self._process
         self._process = None
-        if process and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
         profile_dir = self._profile_dir
         self._profile_dir = None
-        if profile_dir:
-            shutil.rmtree(profile_dir, ignore_errors=True)
+        try:
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        # Keep shutdown bounded even for an injected/broken
+                        # process handle. The profile cleanup below is still an
+                        # invariant and must not be skipped by this condition.
+                        pass
+        finally:
+            if profile_dir:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+
+    def _chrome_args(self, chrome: Path) -> list[str]:
+        return [
+            str(chrome),
+            f"--remote-debugging-port={self.port}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-allow-origins=http://127.0.0.1:{self.port}",
+            f"--user-data-dir={self._profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            self.login_url,
+        ]
 
     def run(
         self,
@@ -140,16 +170,7 @@ class ChromeCDPLogin:
             raise ChromeLoginError("未检测到 Google Chrome / Chrome Beta")
         status = on_status or (lambda _message: None)
         self._profile_dir = Path(tempfile.mkdtemp(prefix="agentbar-chrome-login-"))
-        args = [
-            str(chrome),
-            f"--remote-debugging-port={self.port}",
-            "--remote-allow-origins=*",
-            f"--user-data-dir={self._profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--new-window",
-            self.login_url,
-        ]
+        args = self._chrome_args(chrome)
         status("正在启动独立 Chrome 登录窗口…")
         try:
             self._process = subprocess.Popen(

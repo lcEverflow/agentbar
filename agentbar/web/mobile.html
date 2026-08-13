@@ -75,7 +75,8 @@ textarea{min-height:88px;resize:vertical}
 <div id="login" style="display:none">
   <h2>需要访问令牌</h2>
   <p style="color:#8e8e93;font-size:13px">在 Mac 菜单栏 AgentBar → 📱 手机访问 中扫码，或手动粘贴 token</p>
-  <input id="tokin" placeholder="token" autocapitalize="off" autocorrect="off">
+  <input id="tokin" type="password" placeholder="token" autocomplete="off"
+         autocapitalize="off" autocorrect="off" spellcheck="false">
   <button id="tokgo" style="width:100%;border:none;border-radius:12px;padding:13px;background:#007aff;color:#fff;font-size:16px">连接</button>
 </div>
 
@@ -109,12 +110,15 @@ textarea{min-height:88px;resize:vertical}
 <script>
 (function(){
 "use strict";
-var qs = new URLSearchParams(location.search);
-if (qs.get("token")) {
-  localStorage.setItem("agentbar_token", qs.get("token"));
-  history.replaceState(null, "", location.pathname);
+var fragment = new URLSearchParams(location.hash.slice(1));
+if (fragment.get("token")) {
+  sessionStorage.setItem("agentbar_token", fragment.get("token"));
+  // Fragment 本就不会发给服务器；再立即从地址栏清除，避免屏幕分享泄漏。
+  history.replaceState(null, "", location.pathname + location.search);
 }
-var TOKEN = localStorage.getItem("agentbar_token") || "";
+// 清理旧版留下的长期 token；新版只在当前 tab 会话中保留。
+try { localStorage.removeItem("agentbar_token"); } catch (_) {}
+var TOKEN = sessionStorage.getItem("agentbar_token") || "";
 var $ = function(id){ return document.getElementById(id); };
 var TOOLS = [];
 
@@ -122,7 +126,10 @@ function api(method, path, body) {
   return fetch(path, {
     method: method,
     headers: {"X-Agentbar-Token": TOKEN, "Content-Type": "application/json"},
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer"
   }).then(function(r){ return r.json(); });
 }
 
@@ -135,7 +142,7 @@ function needLogin() {
 $("tokgo").onclick = function(){
   var t = $("tokin").value.trim();
   if (!t) return;
-  localStorage.setItem("agentbar_token", t);
+  sessionStorage.setItem("agentbar_token", t);
   location.reload();
 };
 
@@ -143,7 +150,7 @@ var STATE_TXT = {running:"运行中", queued:"排队", waiting_quota:"等额度"
                  paused:"暂停", succeeded:"成功", failed:"失败", cancelled:"已取消"};
 var ACTIVE = {running:1, queued:1, waiting_quota:1, paused:1};
 
-function esc(s){ var d=document.createElement("i"); d.textContent=s||""; return d.innerHTML; }
+function esc(s){ var d=document.createElement("i"); d.textContent=String(s == null ? "" : s); return d.innerHTML; }
 function clock(ts){
   if (!ts) return "";
   var d = new Date(ts*1000), now = new Date();
@@ -168,11 +175,11 @@ function render(s) {
   var h = "";
   act.concat(done).forEach(function(t){
     h += '<div class="card"><div class="trow">'
-      + '<div class="dot d-'+t.state+'"></div>'
+      + '<div class="dot d-'+esc(t.state)+'"></div>'
       + '<div class="ttitle">'+esc(t.title||t.prompt||"")+'</div>'
       + '<span class="badge">'+esc(t.tool)+'</span>'
-      + (ACTIVE[t.state] ? '<button class="cancel" data-id="'+t.id+'">取消</button>' : '')
-      + '</div><div class="tmeta">'+(STATE_TXT[t.state]||t.state)
+      + (ACTIVE[t.state] ? '<button class="cancel" data-id="'+esc(t.id)+'">取消</button>' : '')
+      + '</div><div class="tmeta">'+esc(STATE_TXT[t.state]||t.state)
       + (t.model ? " · "+esc(t.model) : "")
       + (t.scheduled_at && t.scheduled_at*1000 > Date.now() ? " · ⏰"+clock(t.scheduled_at) : "")
       + " · "+clock(t.created_at)+'</div>'
