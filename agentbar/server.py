@@ -541,6 +541,16 @@ def _make_handler(
             if n == 0:
                 return {}
             if n > MAX_BODY:
+                # Consume one bounded body window before answering. Returning
+                # immediately can close the socket while a normal client is
+                # still sending a just-over-limit payload, turning the useful
+                # 413 into a platform-dependent connection reset. Never drain
+                # an attacker-declared unbounded length; socket timeout still
+                # caps slow senders.
+                try:
+                    self.rfile.read(min(n, MAX_BODY + 1))
+                except OSError:
+                    pass
                 raise _BodyError(413, f"请求体过大（上限 {MAX_BODY} 字节）")
             try:
                 value = json.loads(self.rfile.read(n).decode("utf-8"))

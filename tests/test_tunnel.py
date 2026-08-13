@@ -64,7 +64,10 @@ def test_process_death_detected(tmp_path):
     )
     removed = []
     tm = TunnelManager(8737, on_down=removed.append, binary_override=fake)
-    assert tm.start(timeout=10) is True
+    # The helper may exit between publishing the URL and start() checking its
+    # process. Both an immediate False and a briefly-up True are valid; neither
+    # may leave the manager claiming the dead tunnel is usable.
+    tm.start(timeout=10)
     deadline = time.time() + 5
     while time.time() < deadline and tm.status()["state"] == "up":
         time.sleep(0.1)
