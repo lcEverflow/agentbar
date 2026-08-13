@@ -1,4 +1,5 @@
 import json
+import sys
 from types import SimpleNamespace
 import time
 
@@ -401,7 +402,12 @@ def test_menu_signal_shutdown_reclaims_tunnel_and_active_logins(
             signal_number, callback
         )
     )
-    monkeypatch.setattr("agentbar.menubar.AgentBarApp", FakeApp)
+    # Linux CI intentionally has no PyObjC. Inject the delayed macOS frontend
+    # module so this cross-platform lifecycle test exercises cmd_run without
+    # importing the real AppKit implementation.
+    monkeypatch.setitem(
+        sys.modules, "agentbar.menubar", SimpleNamespace(AgentBarApp=FakeApp)
+    )
 
     settings = SimpleNamespace(state_dir=tmp_path, port=8737, token="secret")
     assert cli.cmd_run(SimpleNamespace(port=None, headless=False), settings) == 0

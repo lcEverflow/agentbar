@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 from urllib.parse import urlparse
@@ -88,6 +89,11 @@ class TunnelManager:
                  f"http://127.0.0.1:{self.port}"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, stdin=subprocess.DEVNULL,
+                # cloudflared may spawn helpers. A private process group lets
+                # stop() close every descendant that inherited the output pipe;
+                # otherwise the reader (and start()) can remain blocked after
+                # the direct child exits.
+                start_new_session=True,
             )
         except OSError as e:
             with self._lock:
@@ -201,11 +207,21 @@ class TunnelManager:
     def _terminate_process(proc: subprocess.Popen) -> None:
         if proc.poll() is not None:
             return
-        proc.terminate()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            proc.terminate()
         try:
             proc.wait(5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            except OSError:
+                proc.kill()
             try:
                 proc.wait(3)
             except subprocess.TimeoutExpired:
