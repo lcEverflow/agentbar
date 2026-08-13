@@ -141,5 +141,5 @@ agentbar_remove_obsolete_log_file /tmp/agentbar.launchd.log
 agentbar_remove_obsolete_log_file /tmp/agentbar.launchd.err.log
 
 echo "已从源码目录安装并启动: $PLIST"
-echo "日志: $STDOUT_LOG / $STDERR_LOG（权限 0600）"
+echo "日志: ${STDOUT_LOG} / ${STDERR_LOG}（权限 0600）"
 echo "提示: 移动或删除源码目录后 LaunchAgent 将无法启动；独立安装请使用 DMG。"
