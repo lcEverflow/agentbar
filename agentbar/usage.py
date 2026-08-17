@@ -1,33 +1,34 @@
-"""Real quota/usage fetchers — approach mirrored from ylab/aiusagebar (Swift).
+"""Quota and login-state fetchers with no direct access to CLI OAuth tokens.
 
-Claude:  GET https://api.anthropic.com/api/oauth/usage
-         AgentBar 运行时只使用用户在额度设置中显式保存的 OAuth Access Token；
-         响应: {five_hour|seven_day|seven_day_opus|seven_day_sonnet:
-                {utilization: 0-100, resets_at: ISO8601}}
+Claude only invokes ``claude auth status --json`` and whitelists non-sensitive
+login metadata. Anthropic exposes no supported third-party subscription quota
+API, so AgentBar never fabricates Claude windows.
 
-Codex:   GET https://chatgpt.com/backend-api/wham/usage
-         AgentBar 运行时使用显式保存的 OAuth Access Token，以及可选 Account ID；
-         响应: {rate_limits: {primary|secondary:
-                {used_percent: 0-100, resets_at: epoch_s, window_duration_mins}}}
-
-诚实原则：拿不到就返回带 error 的结果或 None，绝不编造数字。
+Codex uses a short-lived official App Server session (``account/read`` and
+``account/rateLimits/read``), leaving credential management and refresh to the
+Codex process itself.
 """
 
 from __future__ import annotations
 
-import base64
 import json
-import logging
+import math
+import os
 import re
+import select
+import shutil
+import signal
+import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
 
-log = logging.getLogger("agentbar.usage")
+from . import __version__
 
 HTTP_TIMEOUT = 12
+_STATUS_CACHE_TTL_SECONDS = 30.0
 
 
 @dataclass
@@ -92,25 +93,587 @@ def _http_get_json(url: str, headers: dict) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
-def _parse_iso(value) -> float | None:
-    if not value:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
+@dataclass(frozen=True)
+class _CredentialResolution:
+    """Internal result whose representation intentionally omits credentials."""
+
+    credentials: dict | None = field(default=None, repr=False)
+    source: str = "none"
+    status: str = "not_logged_in"
+    detail: str = "未检测到登录态"
+    needs_authorization: bool = False
+
+    def public(self) -> dict:
+        return {
+            "available": self.credentials is not None,
+            "source": self.source,
+            "status": self.status,
+            "detail": self.detail,
+            "needs_authorization": self.needs_authorization,
+        }
 
 
-def _jwt_payload(token: str) -> dict:
+_credential_status_lock = threading.Lock()
+_credential_status_condition = threading.Condition(_credential_status_lock)
+_credential_status_cache: dict[str, tuple[float, dict]] = {}
+_credential_status_inflight: set[str] = set()
+
+
+def _remember_credential_status(tool: str, result: _CredentialResolution) -> dict:
+    public = result.public()
+    with _credential_status_condition:
+        _credential_status_cache[tool] = (time.monotonic(), public)
+        _credential_status_condition.notify_all()
+    return dict(public)
+
+
+def _clear_credential_status_cache(tool: str | None = None) -> None:
+    """Clear only non-sensitive status cache (kept private except for tests)."""
+    with _credential_status_condition:
+        if tool is None:
+            _credential_status_cache.clear()
+        else:
+            for key in list(_credential_status_cache):
+                if key == tool or key.startswith(f"{tool}\0"):
+                    _credential_status_cache.pop(key, None)
+        _credential_status_condition.notify_all()
+
+
+def _clean_secret(value, *, max_length: int = 65_536) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > max_length:
+        return ""
+    if any(ord(char) < 32 or ord(char) == 127 for char in cleaned):
+        return ""
+    return cleaned
+
+
+def _clean_metadata(value, *, max_length: int = 512) -> str | None:
+    cleaned = _clean_secret(value, max_length=max_length)
+    return cleaned or None
+
+
+# ================= Local CLI credentials =================
+
+
+_CLI_STATUS_TIMEOUT_SECONDS = 8.0
+_CLI_STATUS_MAX_OUTPUT_BYTES = 64 * 1024
+_CODEX_APP_SERVER_TIMEOUT_SECONDS = 15.0
+_CODEX_APP_SERVER_MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+_CODEX_APP_SERVER_MAX_LINE_BYTES = 256 * 1024
+_codex_app_server_lock = threading.Lock()
+
+
+class _CodexAppServerError(RuntimeError):
+    """Deliberately carries no child output, account data, or credentials."""
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        # The session leader may exit while a descendant keeps inherited FDs
+        # open. Its process group still has the original pid, so clean it too.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        return
     try:
-        part = token.split(".")[1]
-        part += "=" * (-len(part) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(part))
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=0.5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_bounded_json_command(
+    argv: list[str],
+    *,
+    env: dict | None = None,
+) -> dict:
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise _CodexAppServerError("start failed") from exc
+    deadline = time.monotonic() + _CLI_STATUS_TIMEOUT_SECONDS
+    output = bytearray()
+    try:
+        if proc.stdout is None:
+            raise _CodexAppServerError("missing stdout")
+        fd = proc.stdout.fileno()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _CodexAppServerError("timeout")
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise _CodexAppServerError("timeout")
+            try:
+                chunk = os.read(fd, 16_384)
+            except OSError as exc:
+                raise _CodexAppServerError("read failed") from exc
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > _CLI_STATUS_MAX_OUTPUT_BYTES:
+                raise _CodexAppServerError("output limit exceeded")
+        try:
+            proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as exc:
+            raise _CodexAppServerError("timeout") from exc
+        try:
+            parsed = json.loads(bytes(output).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _CodexAppServerError("invalid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise _CodexAppServerError("invalid response")
+        return parsed
+    finally:
+        _terminate_process_group(proc)
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
+def _resolve_claude_credentials(
+    *,
+    binary: str = "",
+    env: dict | None = None,
+) -> _CredentialResolution:
+    executable = (binary or "").strip() or shutil.which("claude")
+    if not executable:
+        return _CredentialResolution(
+            None,
+            "claude_auth_status",
+            "unavailable",
+            "未找到 Claude Code CLI",
+        )
+    try:
+        raw = _run_bounded_json_command(
+            [executable, "auth", "status", "--json"],
+            env=env,
+        )
+    except _CodexAppServerError:
+        return _CredentialResolution(
+            None,
+            "claude_auth_status",
+            "unavailable",
+            "无法通过 Claude Code CLI 读取登录状态",
+        )
+    # Whitelist only non-sensitive status fields. In particular, intentionally
+    # discard email, orgId and orgName from Claude's JSON response.
+    if raw.get("loggedIn") is not True:
+        return _CredentialResolution(
+            None,
+            "claude_auth_status",
+            "not_logged_in",
+            "Claude Code 未登录，请先运行 claude 登录",
+        )
+    auth_method = _clean_metadata(raw.get("authMethod"), max_length=160)
+    subscription = _clean_metadata(raw.get("subscriptionType"), max_length=160)
+    return _CredentialResolution(
+        {"plan": subscription, "auth_method": auth_method},
+        "claude_auth_status",
+        "available",
+        "Claude Code 已登录；官方未提供第三方订阅额度接口",
+    )
+
+
+class _JsonLineReader:
+    def __init__(self, proc: subprocess.Popen, deadline: float):
+        if proc.stdout is None:
+            raise _CodexAppServerError("missing stdout")
+        self.proc = proc
+        self.fd = proc.stdout.fileno()
+        self.deadline = deadline
+        self.buffer = bytearray()
+        self.total = 0
+
+    def _next_line(self) -> bytes | None:
+        newline = self.buffer.find(b"\n")
+        if newline < 0:
+            return None
+        line = bytes(self.buffer[:newline])
+        del self.buffer[:newline + 1]
+        return line
+
+    def response(self, request_id: int) -> dict:
+        while True:
+            line = self._next_line()
+            if line is not None:
+                if not line:
+                    continue
+                if len(line) > _CODEX_APP_SERVER_MAX_LINE_BYTES:
+                    raise _CodexAppServerError("line limit exceeded")
+                try:
+                    message = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise _CodexAppServerError("invalid JSONL") from exc
+                if not isinstance(message, dict):
+                    raise _CodexAppServerError("invalid message")
+                # Notifications have no id and are safe to ignore. A server
+                # request needs an explicit host response; fail closed instead
+                # of silently deadlocking or accidentally accepting its id.
+                if "method" in message and "id" in message:
+                    raise _CodexAppServerError("unsupported server request")
+                if message.get("id") == request_id and "method" not in message:
+                    return message
+                continue
+
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise _CodexAppServerError("timeout")
+            ready, _, _ = select.select([self.fd], [], [], remaining)
+            if not ready:
+                raise _CodexAppServerError("timeout")
+            try:
+                chunk = os.read(self.fd, 65_536)
+            except OSError as exc:
+                raise _CodexAppServerError("read failed") from exc
+            if not chunk:
+                raise _CodexAppServerError("unexpected EOF")
+            self.total += len(chunk)
+            if self.total > _CODEX_APP_SERVER_MAX_OUTPUT_BYTES:
+                raise _CodexAppServerError("output limit exceeded")
+            self.buffer.extend(chunk)
+            if (
+                b"\n" not in self.buffer
+                and len(self.buffer) > _CODEX_APP_SERVER_MAX_LINE_BYTES
+            ):
+                raise _CodexAppServerError("line limit exceeded")
+
+
+def _sanitize_codex_window(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    sanitized = {}
+    for key in ("usedPercent", "windowDurationMins", "resetsAt"):
+        item = value.get(key)
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            try:
+                number = float(item)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(number):
+                sanitized[key] = number
+    return sanitized or None
+
+
+def _sanitize_codex_limit(value, fallback_id: str = "") -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    limit_id = _clean_metadata(value.get("limitId") or fallback_id, max_length=160)
+    if not limit_id:
+        return None
+    sanitized = {
+        "limitId": limit_id,
+        "limitName": _clean_metadata(value.get("limitName"), max_length=160),
+        "planType": _clean_metadata(value.get("planType"), max_length=160),
+        "rateLimitReachedType": _clean_metadata(
+            value.get("rateLimitReachedType"), max_length=160
+        ),
+        "primary": _sanitize_codex_window(value.get("primary")),
+        "secondary": _sanitize_codex_window(value.get("secondary")),
+    }
+    return sanitized
+
+
+def _sanitize_codex_limits_result(value: dict) -> dict:
+    base = _sanitize_codex_limit(value.get("rateLimits"))
+    by_id = {}
+    raw_by_id = value.get("rateLimitsByLimitId")
+    if isinstance(raw_by_id, dict):
+        for raw_id, raw_limit in list(raw_by_id.items())[:128]:
+            key = _clean_metadata(raw_id, max_length=160)
+            if not key:
+                continue
+            sanitized = _sanitize_codex_limit(raw_limit, key)
+            if sanitized:
+                by_id[key] = sanitized
+    return {"rateLimits": base, "rateLimitsByLimitId": by_id}
+
+
+def _send_app_server_message(proc: subprocess.Popen, message: dict) -> None:
+    if proc.stdin is None:
+        raise _CodexAppServerError("missing stdin")
+    try:
+        proc.stdin.write(
+            json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError) as exc:
+        raise _CodexAppServerError("write failed") from exc
+
+
+def _codex_app_server_session(
+    *,
+    binary: str = "",
+    env: dict | None = None,
+    include_rate_limits: bool,
+) -> tuple[dict, dict | None]:
+    """Run one bounded official App Server session and return sanitized RPC data."""
+    started_at = time.monotonic()
+    if not _codex_app_server_lock.acquire(timeout=_CODEX_APP_SERVER_TIMEOUT_SECONDS):
+        raise _CodexAppServerError("app server busy")
+    executable = (binary or "").strip() or shutil.which("codex")
+    if not executable:
+        _codex_app_server_lock.release()
+        raise _CodexAppServerError("codex unavailable")
+    proc = None
+    try:
+        try:
+            proc = subprocess.Popen(
+                [executable, "app-server", "--listen", "stdio://"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            raise _CodexAppServerError("start failed") from exc
+        deadline = started_at + _CODEX_APP_SERVER_TIMEOUT_SECONDS
+        if time.monotonic() >= deadline:
+            raise _CodexAppServerError("timeout")
+        reader = _JsonLineReader(proc, deadline)
+        _send_app_server_message(proc, {
+            "method": "initialize",
+            "id": 0,
+            "params": {
+                "clientInfo": {
+                    "name": "agentbar",
+                    "title": "AgentBar",
+                    "version": __version__,
+                }
+            },
+        })
+        initialized = reader.response(0)
+        if "error" in initialized or not isinstance(initialized.get("result"), dict):
+            raise _CodexAppServerError("initialize failed")
+        _send_app_server_message(proc, {"method": "initialized", "params": {}})
+        _send_app_server_message(proc, {
+            "method": "account/read",
+            "id": 1,
+            # Keep status checks local: Codex must not refresh or access the
+            # network merely because AgentBar renders a credentials badge.
+            "params": {"refreshToken": False},
+        })
+        account_response = reader.response(1)
+        if "error" in account_response or not isinstance(account_response.get("result"), dict):
+            raise _CodexAppServerError("account read failed")
+        raw_account_result = account_response["result"]
+        raw_account = raw_account_result.get("account")
+        account_result = {
+            "account": (
+                {
+                    "type": _clean_metadata(raw_account.get("type"), max_length=80),
+                    "planType": _clean_metadata(raw_account.get("planType"), max_length=160),
+                }
+                if isinstance(raw_account, dict)
+                else None
+            ),
+            "requiresOpenaiAuth": raw_account_result.get("requiresOpenaiAuth") is True,
+        }
+        limits_result = None
+        if include_rate_limits and _codex_account_is_chatgpt(account_result):
+            _send_app_server_message(proc, {
+                "method": "account/rateLimits/read",
+                "id": 2,
+            })
+            limits_response = reader.response(2)
+            if "error" in limits_response or not isinstance(limits_response.get("result"), dict):
+                raise _CodexAppServerError("rate limits read failed")
+            limits_result = _sanitize_codex_limits_result(limits_response["result"])
+        return account_result, limits_result
+    finally:
+        try:
+            if proc is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            if proc is not None:
+                _terminate_process_group(proc)
+            if proc is not None and proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+        finally:
+            _codex_app_server_lock.release()
+
+
+def _codex_account_is_chatgpt(account_result: dict) -> bool:
+    account = account_result.get("account")
+    if not isinstance(account, dict):
+        return False
+    return str(account.get("type") or "").casefold() == "chatgpt"
+
+
+def _codex_account_resolution(account_result: dict) -> _CredentialResolution:
+    account = account_result.get("account")
+    if not isinstance(account, dict):
+        return _CredentialResolution(
+            None,
+            "codex_app_server",
+            "not_logged_in",
+            "未检测到 Codex ChatGPT 登录态，请先运行 codex login",
+        )
+    account_type = str(account.get("type") or "").casefold()
+    if account_type == "apikey":
+        return _CredentialResolution(
+            None,
+            "codex_app_server",
+            "api_key_unsupported",
+            "Codex 当前使用 API Key 登录；API Key 不适用于 ChatGPT 订阅额度，请运行 codex login 选择 ChatGPT 登录",
+        )
+    if account_type != "chatgpt":
+        return _CredentialResolution(
+            None,
+            "codex_app_server",
+            "unavailable",
+            "Codex 当前登录类型不支持 ChatGPT 订阅额度",
+        )
+    return _CredentialResolution(
+        {"plan": _clean_metadata(account.get("planType"))},
+        "codex_app_server",
+        "available",
+        "已通过 Codex App Server 读取 ChatGPT 登录态",
+    )
+
+
+def _resolve_codex_credentials(
+    *,
+    binary: str = "",
+    env: dict | None = None,
+) -> _CredentialResolution:
+    try:
+        account_result, _ = _codex_app_server_session(
+            binary=binary,
+            env=env,
+            include_rate_limits=False,
+        )
+    except _CodexAppServerError:
+        return _CredentialResolution(
+            None,
+            "codex_app_server",
+            "unavailable",
+            "无法通过 Codex App Server 读取登录态，请确认 Codex CLI 可用",
+        )
+    return _codex_account_resolution(account_result)
+
+
+def credential_status(
+    tool: str,
+    *,
+    settings=None,
+    allow_interactive: bool = False,
+    refresh: bool = False,
+) -> dict:
+    """Return cached, non-sensitive CLI credential state for UI/snapshots.
+
+    ``refresh`` bypasses the status cache. ``allow_interactive`` is retained for
+    API compatibility but never enables a prompt: AgentBar only invokes the
+    CLIs' non-interactive status protocols and never reads OAuth credentials.
+    """
+    normalized = (tool or "").strip().casefold()
+    if normalized not in {"claude", "codex"}:
+        return {
+            "available": False,
+            "source": "none",
+            "status": "unavailable",
+            "detail": "不支持的凭据来源",
+            "needs_authorization": False,
+        }
+    configured_binary = ""
+    if settings is not None:
+        configured_binary = str(
+            (getattr(settings, "tool_paths", None) or {}).get(normalized) or ""
+        )
+    cache_key = normalized if not configured_binary else f"{normalized}\0{configured_binary}"
+    wait_deadline = time.monotonic() + _CODEX_APP_SERVER_TIMEOUT_SECONDS + 1.0
+    with _credential_status_condition:
+        cached = _credential_status_cache.get(cache_key)
+        if (
+            not refresh
+            and not allow_interactive
+            and cached
+            and time.monotonic() - cached[0] < _STATUS_CACHE_TTL_SECONDS
+        ):
+            return dict(cached[1])
+        while cache_key in _credential_status_inflight:
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                return {
+                    "available": False,
+                    "source": f"{normalized}_cli",
+                    "status": "timeout",
+                    "detail": "CLI 登录状态检测超时",
+                    "needs_authorization": False,
+                }
+            _credential_status_condition.wait(remaining)
+        # Recheck after a concurrent detection finishes. Even explicit refresh
+        # callers share that one just-completed probe instead of immediately
+        # spawning the same CLI process again.
+        cached = _credential_status_cache.get(cache_key)
+        if cached and cached[0] >= wait_deadline - (
+            _CODEX_APP_SERVER_TIMEOUT_SECONDS + 1.0
+        ):
+            return dict(cached[1])
+        _credential_status_inflight.add(cache_key)
+    try:
+        binary, env = _tool_runtime(normalized, settings)
+        result = (
+            _resolve_claude_credentials(binary=binary, env=env)
+            if normalized == "claude"
+            else _resolve_codex_credentials(binary=binary, env=env)
+        )
+        return _remember_credential_status(cache_key, result)
+    finally:
+        with _credential_status_condition:
+            _credential_status_inflight.discard(cache_key)
+            _credential_status_condition.notify_all()
+
+
+def _tool_runtime(tool: str, settings=None) -> tuple[str, dict | None]:
+    if settings is None:
+        return "", None
+    try:
+        if tool == "claude":
+            from .adapters.claude import ClaudeAdapter as AdapterClass
+        else:
+            from .adapters.codex import CodexAdapter as AdapterClass
+        adapter = AdapterClass(settings)
+        binary = adapter.binary() or ""
+        return binary, adapter.build_env(dict(os.environ))
+    except (OSError, ValueError):
+        return "", dict(os.environ)
 
 
 # ================= Claude =================
@@ -118,79 +681,50 @@ def _jwt_payload(token: str) -> dict:
 
 class ClaudeUsageFetcher:
     tool = "claude"
-    URL = "https://api.anthropic.com/api/oauth/usage"
-    _WINDOW_KEYS = [
-        ("five_hour", "5h"),
-        ("seven_day", "7d"),
-        ("seven_day_opus", "7d Opus"),
-        ("seven_day_sonnet", "7d Sonnet"),
-    ]
 
-    def __init__(self, access_token: str = "", model: str = ""):
-        self.access_token = (access_token or "").strip()
-        self.model = (model or "").strip()
+    def __init__(
+        self,
+        *,
+        binary: str = "",
+        env: dict | None = None,
+        settings=None,
+        status_cache_key: str = "claude",
+    ):
+        self.binary = (binary or "").strip()
+        self.env = env
+        self.settings = settings
+        self.status_cache_key = status_cache_key
+
+    def _resolve(self) -> _CredentialResolution:
+        binary, env = (
+            _tool_runtime("claude", self.settings)
+            if self.settings is not None
+            else (self.binary, self.env)
+        )
+        result = _resolve_claude_credentials(binary=binary, env=env)
+        _remember_credential_status(self.status_cache_key, result)
+        return result
 
     def load_credentials(self) -> dict | None:
-        if not self.access_token:
-            return None
-        return {"token": self.access_token, "plan": None}
+        return self._resolve().credentials
 
     def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
-        creds = self.load_credentials()
-        if not creds:
+        result = self._resolve()
+        if not result.credentials:
             return UsageSnapshot(
-                self.tool, source="oauth_api",
-                error="未配置 Claude OAuth Access Token",
+                self.tool,
+                source="claude_auth_status",
+                error=result.detail,
             )
-        headers = {
-            "Authorization": f"Bearer {creds['token']}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.0",
-        }
-        try:
-            data = _http_get_json(self.URL, headers)
-        except urllib.error.HTTPError as e:
-            return UsageSnapshot(self.tool, source="oauth_api",
-                                 error=f"usage 接口 HTTP {e.code}")
-        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-            return UsageSnapshot(self.tool, source="oauth_api", error=f"网络错误: {e}")
-        return self.parse(data, plan=creds.get("plan"))
-
-    def parse(self, data: dict, plan: str | None = None) -> UsageSnapshot:
-        windows = []
-        selected = self.model.casefold()
-        selected_family = (
-            "opus" if "opus" in selected else "sonnet" if "sonnet" in selected else ""
-        )
-        for key, label in self._WINDOW_KEYS:
-            # 选中 Opus/Sonnet 时，保留账户通用窗口，只隐藏另一个
-            # 模型家族的专属周窗口。其他模型仍展示账户通用额度。
-            if key.startswith("seven_day_") and (
-                not selected_family or not key.endswith(selected_family)
-            ):
-                continue
-            w = data.get(key)
-            if not isinstance(w, dict) or w.get("utilization") is None:
-                continue
-            windows.append(UsageWindow(
-                label=label,
-                used_percent=max(0.0, min(100.0, float(w["utilization"]))),
-                resets_at=_parse_iso(w.get("resets_at")),
-                model=selected_family if key.startswith("seven_day_") else None,
-            ))
-        snap = UsageSnapshot(
+        # Anthropic does not expose a supported third-party subscription quota
+        # API. Keep this source status-only; scheduling continues to rely on
+        # observed CLI limit events and local ccusage data.
+        return UsageSnapshot(
             self.tool,
-            windows=windows,
-            plan=plan,
-            source="oauth_api",
-            model=self.model or None,
-            available_models=["opus", "sonnet"],
+            windows=[],
+            plan=result.credentials.get("plan"),
+            source="claude_auth_status",
         )
-        if not windows:
-            snap.error = "usage 接口未返回可识别的额度窗口"
-        return snap
 
 
 # ================= Codex =================
@@ -198,50 +732,73 @@ class ClaudeUsageFetcher:
 
 class CodexUsageFetcher:
     tool = "codex"
-    URL = "https://chatgpt.com/backend-api/wham/usage"
 
-    def __init__(self, access_token: str = "", account_id: str = "", model: str = ""):
-        self.access_token = (access_token or "").strip()
-        self.account_id = (account_id or "").strip()
+    def __init__(
+        self,
+        *,
+        model: str = "",
+        binary: str = "",
+        env: dict | None = None,
+        settings=None,
+        status_cache_key: str = "codex",
+    ):
         self.model = (model or "").strip()
+        self.binary = (binary or "").strip()
+        self.env = env
+        self.settings = settings
+        self.status_cache_key = status_cache_key
 
     def load_credentials(self) -> dict | None:
-        if not self.access_token:
-            return None
-        access_payload = _jwt_payload(self.access_token)
-        auth_claim = access_payload.get("https://api.openai.com/auth") or {}
-        account_id = (
-            self.account_id
-            or auth_claim.get("chatgpt_account_id")
-            or access_payload.get("chatgpt_account_id")
-            or access_payload.get("account_id")
+        binary, env = (
+            _tool_runtime("codex", self.settings)
+            if self.settings is not None
+            else (self.binary, self.env)
         )
-        plan = auth_claim.get("chatgpt_plan_type") or access_payload.get("chatgpt_plan_type")
-        return {"token": self.access_token, "account_id": account_id, "plan": plan}
+        result = _resolve_codex_credentials(binary=binary, env=env)
+        _remember_credential_status(self.status_cache_key, result)
+        return result.credentials
 
     def fetch(self, interactive: bool = False) -> UsageSnapshot | None:
-        creds = self.load_credentials()
-        if not creds:
-            return UsageSnapshot(self.tool, source="wham_api",
-                                 error="未配置 Codex OAuth Access Token")
-        headers = {
-            "Authorization": f"Bearer {creds['token']}",
-            "Accept": "*/*",
-            "Referer": "https://chatgpt.com/codex/cloud/settings/analytics",
-            "x-openai-target-path": "/backend-api/wham/usage",
-            "x-openai-target-route": "/backend-api/wham/usage",
-            "User-Agent": "agentbar/0.2",
-        }
-        if creds.get("account_id"):
-            headers["chatgpt-account-id"] = creds["account_id"]
+        binary, env = (
+            _tool_runtime("codex", self.settings)
+            if self.settings is not None
+            else (self.binary, self.env)
+        )
         try:
-            data = _http_get_json(self.URL, headers)
-        except urllib.error.HTTPError as e:
-            return UsageSnapshot(self.tool, source="wham_api",
-                                 error=f"usage 接口 HTTP {e.code}")
-        except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-            return UsageSnapshot(self.tool, source="wham_api", error=f"网络错误: {e}")
-        return self.parse(data, plan=creds.get("plan"))
+            account_result, limits_result = _codex_app_server_session(
+                binary=binary,
+                env=env,
+                include_rate_limits=True,
+            )
+        except _CodexAppServerError:
+            result = _CredentialResolution(
+                None,
+                "codex_app_server",
+                "unavailable",
+                "Codex App Server 额度能力不可用；将继续使用本地观测的限额事件",
+            )
+            _remember_credential_status(self.status_cache_key, result)
+            return UsageSnapshot(
+                self.tool,
+                source="codex_app_server",
+                error=result.detail,
+            )
+        result = _codex_account_resolution(account_result)
+        _remember_credential_status(self.status_cache_key, result)
+        if not result.credentials:
+            return UsageSnapshot(
+                self.tool,
+                source="codex_app_server",
+                error=result.detail,
+            )
+        if not isinstance(limits_result, dict):
+            return UsageSnapshot(
+                self.tool,
+                plan=result.credentials.get("plan"),
+                source="codex_app_server",
+                error="Codex App Server 未返回额度；将继续使用本地观测的限额事件",
+            )
+        return self.parse(limits_result, plan=result.credentials.get("plan"))
 
     @staticmethod
     def _model_key(value: str) -> str:
@@ -270,7 +827,14 @@ class CodexUsageFetcher:
             seconds = w.get("limit_window_seconds") or w.get("limitWindowSeconds")
             label = fallback_label
             if mins:
-                label = f"{round(mins / 60)}h" if mins < 2880 else f"{round(mins / 1440)}d"
+                if mins < 60:
+                    label = f"{round(mins)}m"
+                else:
+                    label = (
+                        f"{round(mins / 60)}h"
+                        if mins < 2880
+                        else f"{round(mins / 1440)}d"
+                    )
             elif seconds:
                 label = f"{round(seconds / 3600)}h" if seconds < 2880 * 60 else f"{round(seconds / 86400)}d"
             reset = w.get(
@@ -293,15 +857,37 @@ class CodexUsageFetcher:
         return (
             bool(limits.get("limit_reached", limits.get("limitReached")))
             or limits.get("allowed") is False
+            or bool(limits.get("rateLimitReachedType"))
         )
 
     def parse(self, data: dict, plan: str | None = None) -> UsageSnapshot:
-        """Parse both observed WHAM response shapes.
+        """Parse official App Server limits and older saved fixture shapes.
 
-        Older clients expose ``rate_limits.primary`` with minute windows, while
-        the current ChatGPT-backed response exposes ``rate_limit.primary_window``
-        with second windows and a ``limit_reached`` boolean.
+        Live fetching only uses ``rateLimits``/``rateLimitsByLimitId`` from the
+        Codex process; the compatibility shape is retained for existing local
+        snapshots and parser tests.
         """
+        native_by_id = data.get("rateLimitsByLimitId")
+        native_base = data.get("rateLimits")
+        native_shape = isinstance(native_by_id, dict) or isinstance(native_base, dict)
+        if native_shape:
+            native_items = []
+            for limit_id, limit in (native_by_id or {}).items():
+                if isinstance(limit, dict):
+                    native_items.append({
+                        "limit_name": limit.get("limitName"),
+                        "metered_feature": limit.get("limitId") or limit_id,
+                        "rate_limit": limit,
+                    })
+            data = {
+                "plan_type": (
+                    native_base.get("planType")
+                    if isinstance(native_base, dict)
+                    else None
+                ),
+                "rate_limit": native_base or {},
+                "additional_rate_limits": native_items,
+            }
         additional = [
             item for item in (data.get("additional_rate_limits") or [])
             if isinstance(item, dict)
@@ -326,7 +912,7 @@ class CodexUsageFetcher:
                 return UsageSnapshot(
                     self.tool,
                     plan=plan or data.get("plan_type"),
-                    source="wham_api",
+                    source="codex_app_server",
                     error=f"未找到模型额度 {self.model!r}；接口可用：{choices}",
                     model=self.model,
                     available_models=available,
@@ -346,11 +932,15 @@ class CodexUsageFetcher:
         if selected_item is not None:
             selected_limits = selected_item.get("rate_limit") or {}
             selected_limited = self._limited(selected_limits)
-            windows = self._windows(
-                account_limits,
-                limited=account_limited,
-                label_prefix="账户 ",
-            )
+            selected_id = str(selected_item.get("metered_feature") or "")
+            account_id = str(account_limits.get("limitId") or "")
+            windows = []
+            if not native_shape or not account_id or selected_id != account_id:
+                windows = self._windows(
+                    account_limits,
+                    limited=account_limited,
+                    label_prefix="账户 ",
+                )
             windows.extend(self._windows(
                 selected_limits,
                 model=selected_label,
@@ -364,7 +954,7 @@ class CodexUsageFetcher:
             self.tool,
             windows=windows,
             plan=plan or data.get("plan_type"),
-            source="wham_api",
+            source="codex_app_server",
             # 保留 snapshot 级标记给旧 UI；调度决策应按 window.model
             # 逐窗口判断，避免模型专属限额污染账户级窗口。
             limited=account_limited or selected_limited,
@@ -372,7 +962,7 @@ class CodexUsageFetcher:
             available_models=available,
         )
         if not windows:
-            snap.error = "usage 接口未返回 rate_limits"
+            snap.error = "Codex App Server 未返回可识别的额度窗口"
         return snap
 
 
@@ -568,26 +1158,30 @@ _CORP_FETCHERS = {
 
 
 def get_usage_fetchers(settings=None) -> dict[str, object]:
-    """只创建用户显式启用且已配凭据的额度来源。
+    """只创建用户显式启用的额度/登录状态来源。
 
-    没有 Settings 也不创建隐式来源，确保任何调用路径都不会读取 CLI
-    登录文件或系统凭据存储。
+    Claude 仅查询官方 CLI 的非敏感登录状态；Codex 仅通过官方
+    App Server 查额度。两者都不读取或保存 OAuth token。
     """
     fetchers: dict[str, object] = {}
     if settings is not None:
         sources = getattr(settings, "quota_sources", None) or {}
         claude = sources.get("claude") or {}
-        if claude.get("enabled") and (claude.get("access_token") or "").strip():
+        if claude.get("enabled"):
+            configured = str((getattr(settings, "tool_paths", None) or {}).get("claude") or "")
             fetchers["claude"] = ClaudeUsageFetcher(
-                access_token=claude.get("access_token", ""),
-                model=claude.get("model", ""),
+                binary=os.path.expanduser(configured) if configured else "",
+                settings=settings,
+                status_cache_key=("claude" if not configured else f"claude\0{configured}"),
             )
         codex = sources.get("codex") or {}
-        if codex.get("enabled") and (codex.get("access_token") or "").strip():
+        if codex.get("enabled"):
+            configured = str((getattr(settings, "tool_paths", None) or {}).get("codex") or "")
             fetchers["codex"] = CodexUsageFetcher(
-                access_token=codex.get("access_token", ""),
-                account_id=codex.get("account_id", ""),
                 model=codex.get("model", ""),
+                binary=os.path.expanduser(configured) if configured else "",
+                settings=settings,
+                status_cache_key=("codex" if not configured else f"codex\0{configured}"),
             )
     providers = getattr(settings, "providers", None) or {}
     for name, cls in _CORP_FETCHERS.items():

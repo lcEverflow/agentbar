@@ -144,12 +144,13 @@ def _quota_submenu(tool: str, qi: dict, quota_cfg: dict | None = None) -> dict:
     children: list[dict] = []
     model = str(qi.get("model") or "").strip()
     if model:
-        children.append(_info(f"模型 {model}"))
+        selector_name = "limitId" if tool == "codex" else "额度分类"
+        children.append(_info(f"{selector_name} {model}"))
     available_models = [
         str(value) for value in (qi.get("available_models") or []) if str(value).strip()
     ]
     if available_models:
-        children.append(_info(f"可选额度标识 {'、'.join(available_models[:4])}"))
+        children.append(_info(f"可选 limitId {'、'.join(available_models[:4])}"))
     for w in qi.get("windows") or []:
         line = f"{w['label']} 已用 {_window_value(w)}"
         if w.get("unit") in ("credits", "token"):
@@ -172,11 +173,11 @@ def _quota_submenu(tool: str, qi: dict, quota_cfg: dict | None = None) -> dict:
         children.append(_action(f"⚠ {qi['error'][:70]}"))
     children.append(_sep())
     if tool in ("claude", "codex"):
-        # 任务观测也可能产生 quota 行，但只有显式启用且已配
-        # 手动密钥的来源才能请求上游；配置入口始终保留。
+        # 任务观测也可能产生 quota 行。只有显式启用的来源才可
+        # 请求来源；AgentBar 只调用 CLI 的受支持状态/额度接口，不读取凭据。
         quota_cfg = quota_cfg or {}
-        if quota_cfg.get("enabled") and quota_cfg.get("key_set"):
-            children.append(_action("↻ 立即刷新额度", f"refresh_quota:{tool}"))
+        if quota_cfg.get("enabled"):
+            children.append(_action("↻ 重新检测并刷新额度", f"refresh_quota:{tool}"))
         children.append(_action(f"⚙ 配置 {_provider_name(tool)}…", "provider_settings"))
     else:
         children.append(_action("↻ 立即刷新额度", f"refresh_quota:{tool}"))
@@ -190,27 +191,20 @@ def _quota_submenu(tool: str, qi: dict, quota_cfg: dict | None = None) -> dict:
 
 
 def _quota_source_setup_submenu(tool: str, cfg: dict) -> dict:
-    """Claude/Codex manual quota setup row when no live snapshot exists."""
+    """Claude/Codex automatic CLI-auth setup row without a live snapshot."""
     enabled = bool(cfg.get("enabled"))
-    key_set = bool(cfg.get("key_set"))
     model = str(cfg.get("model") or "").strip()
-    if enabled and key_set:
+    if enabled:
         state = "等待刷新"
-        detail = "已启用且额度凭据已配置。"
-    elif enabled:
-        state = "缺少密钥"
-        detail = "已启用，但尚未配置额度访问凭据。"
-    elif key_set:
-        state = "未启用"
-        detail = "额度凭据已保存；启用后才会请求额度。"
+        detail = "已启用；刷新时自动读取本机 CLI 登录态。"
     else:
-        state = "未配置"
-        detail = "点击配置，手动选择额度模型并输入访问凭据。"
+        state = "未启用"
+        detail = "启用后自动读取本机 CLI 登录态，无需填写密钥。"
     children = [_info(detail)]
     if model:
-        children.append(_info(f"模型 {model}"))
-    if enabled and key_set:
-        children.append(_action("↻ 立即刷新额度", f"refresh_quota:{tool}"))
+        children.append(_info(f"limitId {model}" if tool == "codex" else f"额度分类 {model}"))
+    if enabled:
+        children.append(_action("↻ 重新检测并刷新额度", f"refresh_quota:{tool}"))
     children.append(_action(f"⚙ 配置 {_provider_name(tool)}…", "provider_settings"))
     model_label = f" · {model}" if model else ""
     return _submenu(

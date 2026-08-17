@@ -2,6 +2,7 @@
 
 import copy
 import threading
+import time
 from types import SimpleNamespace
 
 from AppKit import NSAlertFirstButtonReturn
@@ -15,6 +16,22 @@ class _Quota:
         self.reloads = 0
         self.reload_args = []
         self.refreshes = []
+        self.statuses = {
+            "claude": {
+                "available": True,
+                "source": "claude_cli",
+                "status": "available",
+                "detail": "Claude Code 已登录",
+                "needs_authorization": False,
+            },
+            "codex": {
+                "available": True,
+                "source": "codex_app_server",
+                "status": "available",
+                "detail": "Codex CLI 已登录",
+                "needs_authorization": False,
+            },
+        }
 
     def reload_fetchers(self, refresh=True):
         self.reloads += 1
@@ -23,10 +40,22 @@ class _Quota:
     def refresh_now(self, tool=None):
         self.refreshes.append(tool)
 
+    def credential_status(self, tool, **_kwargs):
+        return dict(self.statuses[tool])
+
 
 class _Core:
     def __init__(self):
         self.quota = _Quota()
+
+    def snapshot(self):
+        return {
+            "quota": {
+                "codex": {
+                    "available_models": ["codex_primary", "codex_spark"],
+                },
+            },
+        }
 
 
 def _controller(tmp_path):
@@ -36,8 +65,20 @@ def _controller(tmp_path):
         core, settings
     )
     controller._build()
+    controller._credential_status = {
+        source: dict(status) for source, status in core.quota.statuses.items()
+    }
     controller._reload_controls()
     return controller, core, settings
+
+
+def _wait_for(predicate, timeout=2):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
 
 
 def test_native_provider_window_contains_all_quota_sources(tmp_path):
@@ -51,13 +92,78 @@ def test_native_provider_window_contains_all_quota_sources(tmp_path):
         assert "未配置 Cookie" in str(controller._status["mytoken"].stringValue())
         assert "浏览器登录" in str(controller._chrome_buttons["mytoken"].title())
         assert "已有登录" in str(controller._import_buttons["mytoken"].title())
-        assert "OAuth Access Token" in str(controller._status["claude"].stringValue())
-        assert str(controller._source_key["claude"].stringValue()) == ""
-        assert "metered_feature" in str(
+        assert "检测" in str(controller._status["claude"].stringValue())
+        assert "claude" not in controller._source_model
+        assert not hasattr(controller, "_source_key")
+        assert not hasattr(controller, "_source_account")
+        assert "limitId" in str(
             controller._source_model["codex"].placeholderString()
         )
+        assert list(controller._source_model["codex"].objectValues()) == [
+            "codex_primary", "codex_spark",
+        ]
         assert controller.auto_refresh_check.state() == 0
     finally:
+        controller.window.close()
+
+
+def test_native_cli_detection_never_blocks_appkit_main_thread(tmp_path):
+    settings = load_settings(tmp_path / "nonblocking-provider-window")
+    core = _Core()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocking_status(tool, **kwargs):
+        calls.append((tool, kwargs))
+        started.set()
+        assert release.wait(2)
+        return dict(core.quota.statuses[tool])
+
+    core.quota.credential_status = blocking_status
+    controller = ProviderSettingsWindowController.alloc().initWithCore_settings_(
+        core, settings
+    )
+    controller._build()
+    try:
+        before = time.monotonic()
+        controller._reload_controls()
+        elapsed = time.monotonic() - before
+
+        assert elapsed < 0.2
+        assert started.wait(1)
+        assert "检测" in str(controller._status["claude"].stringValue())
+    finally:
+        release.set()
+        controller.window.close()
+    assert all(call[1]["allow_interactive"] is False for call in calls)
+    assert all(call[1]["settings"] is settings for call in calls)
+
+
+def test_native_save_applies_slow_fetcher_reload_off_main_thread(tmp_path):
+    controller, core, settings = _controller(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_reload(refresh=True):
+        started.set()
+        assert release.wait(2)
+        core.quota.reloads += 1
+        core.quota.reload_args.append(refresh)
+
+    core.quota.reload_fetchers = slow_reload
+    controller._enabled["codex"].setState_(1)
+    try:
+        before = time.monotonic()
+        controller.onSave_(None)
+        elapsed = time.monotonic() - before
+
+        assert elapsed < 0.2
+        assert settings.quota_sources["codex"]["enabled"] is True
+        assert started.wait(1)
+        assert "正在后台" in str(controller._message.stringValue())
+    finally:
+        release.set()
         controller.window.close()
 
 
@@ -170,6 +276,7 @@ def test_native_provider_save_updates_settings_and_refreshes(tmp_path):
         assert settings.providers["mytoken"]["refresh_seconds"] == 90
         assert settings.providers["mytoken"]["cookie"] == "SESSION=secret"
         assert settings.title_provider == "mytoken"
+        assert _wait_for(lambda: core.quota.refreshes == ["mytoken"])
         assert core.quota.reloads == 1
         assert core.quota.reload_args == [False]
         assert core.quota.refreshes == ["mytoken"]
@@ -178,43 +285,27 @@ def test_native_provider_save_updates_settings_and_refreshes(tmp_path):
         controller.window.close()
 
 
-def test_native_subscription_sources_save_write_only_tokens(tmp_path):
+def test_native_subscription_sources_use_detected_cli_login(tmp_path):
     controller, core, settings = _controller(tmp_path)
     try:
         controller._enabled["claude"].setState_(1)
-        controller._source_model["claude"].setStringValue_("sonnet")
-        controller._source_key["claude"].setStringValue_("claude-oauth-secret")
-
         controller._enabled["codex"].setState_(1)
         controller._source_model["codex"].setStringValue_("codex_other")
-        controller._source_key["codex"].setStringValue_("codex-oauth-secret")
-        controller._source_account["codex"].setStringValue_("account-123")
         controller.onSave_(None)
 
-        assert settings.quota_sources["claude"] == {
-            "enabled": True,
-            "model": "sonnet",
-            "access_token": "claude-oauth-secret",
-            "account_id": "",
-        }
+        assert settings.quota_sources["claude"] == {"enabled": True}
         assert settings.quota_sources["codex"] == {
-            "enabled": True,
-            "model": "codex_other",
-            "access_token": "codex-oauth-secret",
-            "account_id": "account-123",
+            "enabled": True, "model": "codex_other",
         }
+        assert _wait_for(lambda: core.quota.refreshes == ["claude", "codex"])
         assert core.quota.reloads == 1
         assert core.quota.reload_args == [False]
         assert core.quota.refreshes == ["claude", "codex"]
-        # Reload after save must never put a persisted secret back into a control.
-        assert str(controller._source_key["claude"].stringValue()) == ""
-        assert str(controller._source_key["codex"].stringValue()) == ""
-        assert "secret" not in str(controller._status["claude"].stringValue())
     finally:
         controller.window.close()
 
 
-def test_native_blank_subscription_credentials_preserve_saved_values(tmp_path):
+def test_native_save_removes_legacy_subscription_secrets(tmp_path):
     controller, core, settings = _controller(tmp_path)
     try:
         settings.quota_sources["claude"].update({
@@ -229,65 +320,19 @@ def test_native_blank_subscription_credentials_preserve_saved_values(tmp_path):
             "account_id": "keep-account",
         })
         controller._reload_controls()
-        controller._source_model["claude"].setStringValue_("sonnet")
+        controller._source_model["codex"].setStringValue_("new-limit")
         controller.onSave_(None)
 
-        assert settings.quota_sources["claude"]["access_token"] == "keep-this-token"
-        assert settings.quota_sources["claude"]["model"] == "sonnet"
-        assert settings.quota_sources["codex"]["access_token"] == "keep-codex-token"
-        assert settings.quota_sources["codex"]["account_id"] == "keep-account"
+        assert "access_token" not in settings.quota_sources["claude"]
+        assert "account_id" not in settings.quota_sources["claude"]
+        assert "model" not in settings.quota_sources["claude"]
+        assert "access_token" not in settings.quota_sources["codex"]
+        assert "account_id" not in settings.quota_sources["codex"]
+        assert settings.quota_sources["codex"]["model"] == "new-limit"
+        assert _wait_for(lambda: core.quota.refreshes == ["codex"])
         assert core.quota.reloads == 1
         assert core.quota.reload_args == [False]
-        assert core.quota.refreshes == ["claude"]
-    finally:
-        controller.window.close()
-
-
-def test_native_codex_account_id_can_be_cleared_without_deleting_token(
-    tmp_path, monkeypatch,
-):
-    controller, core, settings = _controller(tmp_path)
-    settings.quota_sources["codex"].update({
-        "enabled": True,
-        "access_token": "keep-codex-token",
-        "account_id": "remove-account",
-    })
-
-    class ConfirmAlert:
-        @classmethod
-        def alloc(cls):
-            return cls()
-
-        def init(self):
-            return self
-
-        def setMessageText_(self, _text):
-            pass
-
-        def setInformativeText_(self, _text):
-            pass
-
-        def addButtonWithTitle_(self, _title):
-            pass
-
-        def runModal(self):
-            return NSAlertFirstButtonReturn
-
-    monkeypatch.setattr("agentbar.provider_window.NSAlert", ConfirmAlert)
-    try:
-        controller._reload_controls()
-        assert controller._source_account_clear["codex"].isEnabled()
-
-        controller.onClearAccount_(
-            SimpleNamespace(representedObject=lambda: "codex")
-        )
-
-        assert settings.quota_sources["codex"]["account_id"] == ""
-        assert settings.quota_sources["codex"]["access_token"] == "keep-codex-token"
-        assert settings.quota_sources["codex"]["enabled"] is True
-        assert core.quota.reload_args == [False]
         assert core.quota.refreshes == ["codex"]
-        assert not controller._source_account_clear["codex"].isEnabled()
     finally:
         controller.window.close()
 
@@ -295,29 +340,34 @@ def test_native_codex_account_id_can_be_cleared_without_deleting_token(
 def test_native_manual_refresh_is_source_scoped(tmp_path):
     controller, core, settings = _controller(tmp_path)
     try:
-        settings.quota_sources["claude"].update({
-            "enabled": True,
-            "access_token": "configured-token",
-        })
+        settings.quota_sources["claude"]["enabled"] = True
         controller._reload_controls()
         controller.onRefreshSource_(controller._source_refresh_buttons["claude"])
+        deadline = time.time() + 2
+        while time.time() < deadline and not core.quota.refreshes:
+            time.sleep(0.01)
         assert core.quota.refreshes == ["claude"]
-        assert "手动额度刷新" in str(controller._message.stringValue())
     finally:
         controller.window.close()
 
 
-def test_native_enabled_subscription_requires_access_token(tmp_path):
+def test_native_can_save_enabled_source_while_cli_is_logged_out(tmp_path):
     controller, core, settings = _controller(tmp_path)
     try:
         alerts = []
         controller._alert = lambda title, text: alerts.append((title, text))
+        controller._credential_status["claude"] = {
+            "available": False,
+            "detail": "请先运行 claude auth login",
+        }
         controller._enabled["claude"].setState_(1)
         controller.onSave_(None)
 
-        assert core.quota.reloads == 0
-        assert settings.quota_sources["claude"]["enabled"] is False
-        assert alerts and "OAuth Access Token" in alerts[0][1]
+        assert _wait_for(lambda: core.quota.reloads == 1)
+        assert core.quota.reloads == 1
+        assert settings.quota_sources["claude"]["enabled"] is True
+        assert core.quota.refreshes == []
+        assert alerts == []
     finally:
         controller.window.close()
 
@@ -343,6 +393,7 @@ def test_native_auto_refresh_toggle_reschedules_without_fetching(tmp_path):
         controller.onSave_(None)
 
         assert settings.usage_auto_refresh is True
+        assert _wait_for(lambda: core.quota.reloads == 1)
         assert core.quota.reload_args == [False]
         assert core.quota.refreshes == []
     finally:
@@ -420,14 +471,11 @@ def test_native_read_modify_save_paths_hold_settings_lock(tmp_path, monkeypatch)
             "mytoken",
             SimpleNamespace(header="session=secret", source="test", count=1),
         )
-        controller.onClearSource_(
-            SimpleNamespace(representedObject=lambda: "claude")
-        )
         controller.onClear_(
             SimpleNamespace(representedObject=lambda: "mytoken")
         )
 
-        assert lock_states == [True, True, True, True]
+        assert lock_states == [True, True, True]
     finally:
         controller.window.close()
 
@@ -443,7 +491,6 @@ def test_native_save_failure_rolls_back_all_settings(tmp_path, monkeypatch):
     alerts = []
     controller._alert = lambda title, text: alerts.append((title, text))
     controller._enabled["claude"].setState_(1)
-    controller._source_key["claude"].setStringValue_("new-secret")
     controller._enabled["mytoken"].setState_(1)
     controller._cookie["mytoken"].setStringValue_("SESSION=new-secret")
     controller.title_popup.selectItemAtIndex_(2)
@@ -467,12 +514,8 @@ def test_native_save_failure_rolls_back_all_settings(tmp_path, monkeypatch):
         controller.window.close()
 
 
-def test_native_destructive_save_failure_keeps_credentials(tmp_path, monkeypatch):
+def test_native_destructive_provider_save_failure_keeps_cookie(tmp_path, monkeypatch):
     controller, core, settings = _controller(tmp_path)
-    settings.quota_sources["claude"].update({
-        "enabled": True,
-        "access_token": "keep-token",
-    })
     settings.providers["mytoken"].update({
         "enabled": True,
         "cookie": "SESSION=keep-cookie",
@@ -506,19 +549,16 @@ def test_native_destructive_save_failure_keeps_credentials(tmp_path, monkeypatch
         lambda _settings: (_ for _ in ()).throw(OSError("read only")),
     )
     try:
-        controller.onClearSource_(SimpleNamespace(representedObject=lambda: "claude"))
         controller.onClear_(SimpleNamespace(representedObject=lambda: "mytoken"))
         controller._save_imported_cookie(
             "mytoken",
             SimpleNamespace(header="SESSION=replacement", source="test", count=1),
         )
 
-        assert settings.quota_sources["claude"]["access_token"] == "keep-token"
-        assert settings.quota_sources["claude"]["enabled"] is True
         assert settings.providers["mytoken"]["cookie"] == "SESSION=keep-cookie"
         assert settings.providers["mytoken"]["enabled"] is True
         assert core.quota.reloads == 0
         assert core.quota.refreshes == []
-        assert len(alerts) == 3
+        assert len(alerts) == 2
     finally:
         controller.window.close()

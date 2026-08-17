@@ -1,64 +1,242 @@
+import json
+import os
+import textwrap
+import time
+
 import pytest
 
 from agentbar.config import Settings
-from agentbar.usage import ClaudeUsageFetcher, CodexUsageFetcher
+from agentbar.usage import (
+    ClaudeUsageFetcher,
+    CodexUsageFetcher,
+    credential_status,
+)
 
 
-def test_claude_usage_parse_windows():
-    snap = ClaudeUsageFetcher().parse({
-        "five_hour": {"utilization": 32.5, "resets_at": "2026-07-13T12:00:00Z"},
-        "seven_day": {"utilization": 88, "resets_at": "2026-07-19T12:00:00Z"},
-    }, plan="pro")
-    assert snap.plan == "pro"
-    assert [(w.label, w.used_percent) for w in snap.windows] == [("5h", 32.5), ("7d", 88.0)]
-    assert [w.model for w in snap.windows] == [None, None]
+def _make_cli(tmp_path, name, body):
+    path = tmp_path / name
+    path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body), encoding="utf-8")
+    path.chmod(0o700)
+    return path
 
 
-def test_claude_selected_opus_keeps_common_and_opus_windows_only():
-    snap = ClaudeUsageFetcher(model="claude-opus-4-5").parse({
-        "five_hour": {"utilization": 10},
-        "seven_day": {"utilization": 20},
-        "seven_day_opus": {"utilization": 30},
-        "seven_day_sonnet": {"utilization": 40},
-    })
+def test_claude_uses_status_command_only_and_discards_pii(tmp_path, monkeypatch):
+    cli = _make_cli(tmp_path, "claude", """
+        import json
+        print(json.dumps({
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "subscriptionType": "max",
+            "email": "private@example.test",
+            "orgId": "secret-org-id",
+            "orgName": "Secret Org",
+            "accessToken": "must-never-escape",
+        }))
+    """)
+    monkeypatch.setattr(
+        "agentbar.usage._http_get_json",
+        lambda *args, **kwargs: pytest.fail("Claude must not call a private usage API"),
+    )
 
-    assert snap.model == "claude-opus-4-5"
-    assert snap.available_models == ["opus", "sonnet"]
-    assert [(w.label, w.used_percent, w.model) for w in snap.windows] == [
-        ("5h", 10.0, None),
-        ("7d", 20.0, None),
-        ("7d Opus", 30.0, "opus"),
+    fetcher = ClaudeUsageFetcher(binary=str(cli))
+    creds = fetcher.load_credentials()
+    snap = fetcher.fetch()
+
+    assert creds == {"plan": "max", "auth_method": "claude.ai"}
+    assert snap.windows == []
+    assert snap.plan == "max"
+    assert snap.source == "claude_auth_status"
+    serialized = json.dumps({"creds": creds, "snap": snap.to_dict()})
+    assert "private@example" not in serialized
+    assert "secret-org" not in serialized
+    assert "must-never-escape" not in serialized
+
+
+def test_claude_logged_out_is_diagnostic_and_has_no_fake_windows(tmp_path):
+    cli = _make_cli(tmp_path, "claude", """
+        import json
+        print(json.dumps({"loggedIn": False, "email": "private@example.test"}))
+    """)
+
+    snap = ClaudeUsageFetcher(binary=str(cli)).fetch()
+
+    assert snap.windows == []
+    assert "未登录" in snap.error
+    assert "private@example" not in snap.error
+
+
+def test_credential_status_is_sanitized_and_cached(monkeypatch):
+    import agentbar.usage as usage_module
+
+    usage_module._clear_credential_status_cache()
+    calls = []
+
+    def fake_resolver(**kwargs):
+        calls.append(kwargs)
+        return usage_module._CredentialResolution(
+            {"token": "never-public"}, "claude_auth_status", "available", "ready"
+        )
+
+    monkeypatch.setattr(usage_module, "_resolve_claude_credentials", fake_resolver)
+    first = credential_status("claude")
+    second = credential_status("claude")
+    refreshed = credential_status("claude", refresh=True)
+
+    assert first == second == refreshed == {
+        "available": True,
+        "source": "claude_auth_status",
+        "status": "available",
+        "detail": "ready",
+        "needs_authorization": False,
+    }
+    assert len(calls) == 2
+    assert "token" not in first
+
+
+def test_codex_fetches_official_app_server_rate_limits(tmp_path):
+    cli = _make_cli(tmp_path, "codex", """
+        import json, sys
+        for line in sys.stdin:
+            message = json.loads(line)
+            method = message.get("method")
+            if method == "initialize":
+                print(json.dumps({"id": message["id"], "result": {"serverInfo": {}}}), flush=True)
+            elif method == "account/read":
+                print(json.dumps({"id": message["id"], "result": {
+                    "account": {"type": "chatgpt", "planType": "plus", "email": "private@example.test"},
+                    "requiresOpenaiAuth": True,
+                }}), flush=True)
+            elif method == "account/rateLimits/read":
+                base = {
+                    "limitId": "codex", "limitName": None, "planType": "plus",
+                    "primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1800000000},
+                    "secondary": {"usedPercent": 50, "windowDurationMins": 10080, "resetsAt": 1800100000},
+                    "rateLimitReachedType": None,
+                }
+                other = {
+                    "limitId": "codex_other", "limitName": "Codex Other",
+                    "primary": {"usedPercent": 42, "windowDurationMins": 60, "resetsAt": 1800200000},
+                    "secondary": None, "rateLimitReachedType": "rate_limit_reached",
+                }
+                print(json.dumps({"id": message["id"], "result": {
+                    "rateLimits": base,
+                    "rateLimitsByLimitId": {"codex": base, "codex_other": other},
+                    "untrustedSecret": "must-never-escape",
+                }}), flush=True)
+    """)
+
+    snap = CodexUsageFetcher(binary=str(cli), model="codex_other").fetch()
+
+    assert snap.error is None
+    assert snap.plan == "plus"
+    assert snap.available_models == ["codex", "codex_other"]
+    assert [(w.label, w.used_percent, w.model, w.limited) for w in snap.windows] == [
+        ("账户 5h", 25.0, None, False),
+        ("账户 7d", 50.0, None, False),
+        ("Codex Other 1h", 42.0, "Codex Other", True),
     ]
-    assert snap.to_dict()["windows"][-1]["model"] == "opus"
+    assert "private@example" not in json.dumps(snap.to_dict())
+    assert "must-never-escape" not in json.dumps(snap.to_dict())
 
 
-def test_manual_credentials_are_the_only_credential_source(monkeypatch):
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-be-read")
-    monkeypatch.setenv("CODEX_HOME", "/must/not/be/read")
+def test_codex_api_key_auth_never_requests_subscription_limits(tmp_path):
+    marker = tmp_path / "rate-requested"
+    cli = _make_cli(tmp_path, "codex", f"""
+        import json, pathlib, sys
+        marker = pathlib.Path({str(marker)!r})
+        for line in sys.stdin:
+            message = json.loads(line)
+            method = message.get("method")
+            if method == "initialize":
+                print(json.dumps({{"id": message["id"], "result": {{}}}}), flush=True)
+            elif method == "account/read":
+                print(json.dumps({{"id": message["id"], "result": {{
+                    "account": {{"type": "apiKey"}}, "requiresOpenaiAuth": True
+                }}}}), flush=True)
+            elif method == "account/rateLimits/read":
+                marker.write_text("unexpected")
+    """)
 
-    assert ClaudeUsageFetcher().load_credentials() is None
-    assert CodexUsageFetcher().load_credentials() is None
-    assert ClaudeUsageFetcher(access_token=" configured-claude ").load_credentials() == {
-        "token": "configured-claude",
-        "plan": None,
-    }
-    assert CodexUsageFetcher(
-        access_token=" configured-codex ", account_id=" account-123 "
-    ).load_credentials() == {
-        "token": "configured-codex",
-        "account_id": "account-123",
-        "plan": None,
-    }
+    snap = CodexUsageFetcher(binary=str(cli)).fetch()
+
+    assert snap.windows == []
+    assert "API Key" in snap.error
+    assert not marker.exists()
 
 
-def test_codex_malformed_non_object_jwt_payload_does_not_break_manual_token():
-    # base64url("[]") = W10; the access token is still sent, but no claims can be
-    # inferred from a non-object JWT payload.
-    assert CodexUsageFetcher(access_token="x.W10.y").load_credentials() == {
-        "token": "x.W10.y",
-        "account_id": None,
-        "plan": None,
-    }
+def test_codex_app_server_timeout_kills_process_group(tmp_path, monkeypatch):
+    import agentbar.usage as usage_module
+
+    pid_file = tmp_path / "pid"
+    cli = _make_cli(tmp_path, "codex", f"""
+        import json, os, pathlib, sys, time
+        for line in sys.stdin:
+            message = json.loads(line)
+            if message.get("method") == "initialize":
+                print(json.dumps({{"id": message["id"], "result": {{}}}}), flush=True)
+            elif message.get("method") == "account/read":
+                pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))
+                time.sleep(60)
+    """)
+    monkeypatch.setattr(usage_module, "_CODEX_APP_SERVER_TIMEOUT_SECONDS", 2.0)
+
+    started = time.monotonic()
+    snap = CodexUsageFetcher(binary=str(cli)).fetch()
+
+    assert time.monotonic() - started < 3
+    assert "不可用" in snap.error
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_codex_app_server_rejects_oversized_or_server_request_output(
+    tmp_path, monkeypatch
+):
+    import agentbar.usage as usage_module
+
+    cli = _make_cli(tmp_path, "codex", """
+        import json, sys, time
+        for line in sys.stdin:
+            message = json.loads(line)
+            if message.get("method") == "initialize":
+                print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+            elif message.get("method") == "account/read":
+                sys.stdout.write("x" * 1024)
+                sys.stdout.flush()
+                time.sleep(60)
+    """)
+    monkeypatch.setattr(usage_module, "_CODEX_APP_SERVER_MAX_LINE_BYTES", 128)
+
+    snap = CodexUsageFetcher(binary=str(cli)).fetch()
+
+    assert snap.windows == []
+    assert "不可用" in snap.error
+
+
+def test_codex_app_server_fails_closed_on_server_request(tmp_path):
+    cli = _make_cli(tmp_path, "codex", """
+        import json, sys, time
+        for line in sys.stdin:
+            message = json.loads(line)
+            if message.get("method") == "initialize":
+                print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+            elif message.get("method") == "account/read":
+                print(json.dumps({
+                    "id": 99,
+                    "method": "account/chatgptAuthTokens/refresh",
+                    "params": {"previousAccountId": "must-not-be-retained"},
+                }), flush=True)
+                time.sleep(60)
+    """)
+
+    started = time.monotonic()
+    snap = CodexUsageFetcher(binary=str(cli)).fetch()
+
+    assert time.monotonic() - started < 2
+    assert snap.windows == []
+    assert "不可用" in snap.error
+    assert "must-not-be-retained" not in snap.error
 
 
 def test_codex_usage_parse_windows():
@@ -248,28 +426,17 @@ def test_get_usage_fetchers_gated_by_config():
     assert get_usage_fetchers(None) == {}
 
 
-def test_subscription_fetchers_require_enabled_and_manual_key(tmp_path, monkeypatch):
+def test_subscription_fetchers_require_only_explicit_enablement(tmp_path):
     settings = Settings(state_dir=tmp_path)
     settings.quota_sources = {
-        "claude": {"enabled": True, "access_token": "", "model": "opus"},
-        "codex": {"enabled": True, "access_token": "", "model": "codex_bengalfox"},
+        "claude": {"enabled": True},
+        "codex": {"enabled": True, "model": "codex_bengalfox"},
     }
-    # Even discoverable legacy credentials must not opt a source in implicitly.
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "legacy-claude")
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
-
-    assert get_usage_fetchers(settings) == {}
-
-    settings.quota_sources["claude"]["access_token"] = "manual-claude"
-    settings.quota_sources["codex"].update({
-        "access_token": "manual-codex",
-        "account_id": "account-123",
-    })
     fetchers = get_usage_fetchers(settings)
 
     assert set(fetchers) == {"claude", "codex"}
-    assert fetchers["claude"].access_token == "manual-claude"
-    assert fetchers["claude"].model == "opus"
-    assert fetchers["codex"].access_token == "manual-codex"
-    assert fetchers["codex"].account_id == "account-123"
     assert fetchers["codex"].model == "codex_bengalfox"
+
+    settings.quota_sources["claude"]["enabled"] = False
+    settings.quota_sources["codex"]["enabled"] = False
+    assert get_usage_fetchers(settings) == {}

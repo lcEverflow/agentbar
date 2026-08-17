@@ -668,9 +668,11 @@ class Scheduler:
             cfg = (self.settings.quota_sources or {}).get(name) or {}
             quota_source_config[name] = {
                 "enabled": bool(cfg.get("enabled")),
-                "key_set": bool(str(cfg.get("access_token") or "").strip()),
                 "model": str(cfg.get("model") or ""),
-                "account_id_set": bool(str(cfg.get("account_id") or "").strip()),
+                # CLI capability/login detection can spawn a subprocess. Keep
+                # this 2-second snapshot path non-blocking; settings/API views
+                # detect status on a worker instead.
+                "credential_mode": "auto",
             }
         return {
             "version": __version__,
@@ -691,7 +693,7 @@ class Scheduler:
             # 菜单只需要无敏感信息的配置摘要，用于展示“未配置/待刷新”入口。
             # Cookie 永远不进入 snapshot、日志或前端状态转储。
             "provider_config": provider_config,
-            # access key/account id 永不进入 snapshot。
+            # CLI 登录凭据及派生账户信息永不进入 snapshot。
             "quota_source_config": quota_source_config,
             "cli_processes": self._cli_processes_snapshot(),
             "settings": {

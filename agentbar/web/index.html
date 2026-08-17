@@ -36,7 +36,6 @@
   .providerTop input { min-width:0; flex:0; }
   .providerActions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
   .providerCookie { min-height:46px; font-family:ui-monospace,Menlo,monospace; }
-  .sourceSecret { width:100%; font-family:ui-monospace,Menlo,monospace; }
   .providerSubhead { margin:12px 0 7px; }
   .providerStatus { min-height:18px; margin-top:6px; }
   .meter { height:6px; border-radius:6px; overflow:hidden; background:#2a2f37; }
@@ -127,7 +126,7 @@
     <div class="quotaGrid" id="quotaGrid"></div>
   </section>
   <section id="providerConfigSection">
-    <div class="sectionHead"><h2>额度来源配置</h2><span class="dim">Claude / Codex 必须显式输入 OAuth Access Token；密钥不会回显。</span>
+    <div class="sectionHead"><h2>额度来源配置</h2><span class="dim">自动检测 Claude Code / Codex CLI 登录态；AgentBar 不接收订阅凭据。</span>
       <div class="spacer"></div>
       <label class="dim"><input type="checkbox" id="usageAutoRefresh"/> 周期自动刷新</label>
       <select id="titleProvider" title="菜单栏标题显示哪个 provider 的用量">
@@ -138,7 +137,7 @@
       </select>
       <button class="mini primary" id="btnSaveProviders">保存配置</button>
     </div>
-    <div class="dim providerSubhead">订阅来源 · 保存时仅刷新有变更且凭据就绪的来源；关闭周期刷新后不再自动轮询。</div>
+    <div class="dim providerSubhead">Claude 仅展示 CLI 登录状态与任务观测/ccusage；Codex 额度由 CLI App Server 提供。关闭周期刷新后不再自动轮询。</div>
     <div class="providerGrid" id="quotaSourceGrid"></div>
     <div class="dim providerSubhead">内部来源 · MyToken / Tokenverse 使用本机浏览器登录态；Cookie 只保存在 ~/.agentbar/config.json。</div>
     <div class="providerGrid" id="providerGrid"></div>
@@ -281,8 +280,11 @@ function quotaCards(quota) {
       return `<div class="quotaWindow"><span class="dim">${esc(w.label)}</span><span class="meter ${warn}"><i style="width:${pct}%"></i></span><span>${esc(windowValue(w))}</span></div><div class="dim">${w.resets_at ? `重置：${dateClock(w.resets_at)}` : "未提供重置时间"}</div>`;
     }).join("");
     const available = (qi.available_models || []).length
-      ? `<div class="dim">可选额度标识：${esc(qi.available_models.join(" / "))}</div>` : "";
-    return `<div class="quotaCard"><div class="quotaTitle"><b>${esc(PROVIDER_NAMES[tool] || tool)}</b><span class="origin">${esc(qi.source || "unknown")}${qi.stale ? " · 已过期" : ""}</span></div>${qi.model ? `<div class="dim">额度模型 / metered_feature：${esc(qi.model)}</div>` : ""}${available}${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}${qi.stale ? "（已过期，不参与调度判定）" : ""}` : "未取得实时数据"}</div></div>`;
+      ? `<div class="dim">可选 limitId：${esc(qi.available_models.join(" / "))}</div>` : "";
+    const selection = qi.model
+      ? `<div class="dim">${tool === "codex" ? "limitId" : "观测模型"}：${esc(qi.model)}</div>`
+      : "";
+    return `<div class="quotaCard"><div class="quotaTitle"><b>${esc(PROVIDER_NAMES[tool] || tool)}</b><span class="origin">${esc(qi.source || "unknown")}${qi.stale ? " · 已过期" : ""}</span></div>${selection}${available}${windows || `<div class="dim">${esc(qi.detail || "暂无额度窗口")}</div>`}<div class="dim" title="${esc(qi.error || "")}">${esc(qi.error || qi.detail || "")}</div><div class="dim">${qi.plan ? `套餐：${esc(qi.plan)} · ` : ""}${qi.fetched_at ? `更新：${dateClock(qi.fetched_at)}${qi.stale ? "（已过期，不参与调度判定）" : ""}` : "未取得实时数据"}</div></div>`;
   }).join("");
 }
 
@@ -294,30 +296,22 @@ function renderProviderConfig(cfg) {
   $("quotaSourceGrid").innerHTML = ["claude", "codex"].map(name => {
     const p = sources[name] || {};
     const label = PROVIDER_NAMES[name] || name;
-    const configured = p.key_set
-      ? `OAuth Access Token 已配置${name === "codex" && p.account_id_set ? " · Account ID 已配置" : ""}`
-      : "未配置 OAuth Access Token";
-    const modelLabel = name === "claude" ? "额度模型" : "metered_feature";
-    const modelHint = name === "claude"
-      ? "opus / sonnet；留空=账户通用窗口"
-      : "接口返回的 metered_feature；留空=账户总额度";
-    const account = name === "codex" ? `<input id="q-codex-account" autocomplete="off" placeholder="Codex Account ID（可选；留空保留已配置值）"/>` : "";
+    const stateText = credentialStateText(name, p);
+    const sourceText = p.credential_source && p.credential_source !== "none"
+      ? p.credential_source : "CLI 自动检测";
+    const model = name === "codex" ? `<div class="row">
+        <input id="q-codex-model" list="codexLimitIds" value="${esc(p.model || "")}" placeholder="可选 limitId；留空=默认账户窗口" title="Codex App Server 返回的 limitId"/>
+        <datalist id="codexLimitIds"></datalist>
+      </div>` : `<div class="dim">Anthropic 未提供第三方订阅额度接口；此处只检测 Claude Code 是否已登录。</div>`;
     return `<div class="providerCard" data-quota-source="${name}">
       <div class="providerTop">
         <label><input type="checkbox" id="q-${name}-enabled" ${p.enabled ? "checked" : ""}/> ${esc(label)}</label>
-        <span class="origin">手动 OAuth</span>
+        <span class="origin">${esc(sourceText)}</span>
       </div>
-      <div class="row">
-        <input id="q-${name}-model" value="${esc(p.model || "")}" placeholder="${esc(modelLabel + " · " + modelHint)}" title="${esc(modelHint)}"/>
-        ${account}
-      </div>
-      <input class="sourceSecret" id="q-${name}-key" type="password" autocomplete="off" spellcheck="false"
-             placeholder="OAuth Access Token（留空保留已配置值）"/>
+      ${model}
       <div class="providerActions">
-        <button class="mini" onclick="refreshQuotaSource('${name}')" ${p.enabled && p.key_set ? "" : "disabled"}>刷新此来源</button>
-        ${name === "codex" ? `<button class="mini" onclick="clearCodexAccountId()" ${p.account_id_set ? "" : "disabled"}>清空 Account ID</button>` : ""}
-        <button class="mini" onclick="clearQuotaSource('${name}')">清空 Access Token</button>
-        <span class="dim">${configured}${p.enabled ? "" : " · 已停用"}</span>
+        <button class="mini" onclick="refreshQuotaSource('${name}')">重新检测 / 刷新此来源</button>
+        <span class="dim">${esc(stateText)}${p.enabled ? "" : " · 已停用"}</span>
       </div>
       <div class="dim providerStatus" id="q-${name}-status"></div>
     </div>`;
@@ -355,6 +349,24 @@ function renderProviderConfig(cfg) {
   }).join("");
 }
 
+function credentialStateText(name, source) {
+  if (source.credential_available) {
+    return name === "codex"
+      ? "Codex CLI 已登录，可通过 App Server 读取额度"
+      : "Claude Code 已登录；额度仅展示任务观测与 ccusage";
+  }
+  const status = source.credential_status || "unavailable";
+  if (status === "api_key_unsupported")
+    return "Codex CLI 当前是 API key 登录；请登录 ChatGPT 账户以读取订阅额度";
+  if (["expired", "invalid_credentials"].includes(status))
+    return `${PROVIDER_NAMES[name] || name} 登录态已失效，请在 CLI 中重新登录`;
+  if (status === "timeout")
+    return `${PROVIDER_NAMES[name] || name} 登录态检测超时，请确认 CLI 可正常运行`;
+  if (["unsupported", "unavailable", "error"].includes(status))
+    return `无法检测 ${PROVIDER_NAMES[name] || name} 登录态，请确认 CLI 已安装`;
+  return `未检测到 ${PROVIDER_NAMES[name] || name} 登录态，请先在 CLI 中登录`;
+}
+
 async function loadProviderConfig() {
   try { renderProviderConfig(await api("/api/provider-config")); }
   catch (e) { showBanner("无法读取内部额度配置: " + e.message); }
@@ -372,21 +384,11 @@ function providerPayload(includeEmptyCookie = false) {
     if (cookie || includeEmptyCookie) providers[name].cookie = cookie;
   }
   const quotaSources = {};
-  const configuredSources = (providerConfig && providerConfig.quota_sources) || {};
   for (const name of ["claude", "codex"]) {
-    const accessToken = $(`q-${name}-key`).value.trim();
     const enabled = $(`q-${name}-enabled`).checked;
-    if (enabled && !accessToken && !(configuredSources[name] || {}).key_set)
-      throw new Error(`${PROVIDER_NAMES[name] || name} 启用前必须输入 OAuth Access Token`);
-    quotaSources[name] = {
-      enabled,
-      model: $(`q-${name}-model`).value.trim(),
-    };
-    if (accessToken) quotaSources[name].access_token = accessToken;
-    if (name === "codex") {
-      const accountId = $("q-codex-account").value.trim();
-      if (accountId) quotaSources[name].account_id = accountId;
-    }
+    quotaSources[name] = { enabled };
+    if (name === "codex")
+      quotaSources[name].model = $("q-codex-model").value.trim();
   }
   return {
     providers,
@@ -447,47 +449,27 @@ window.refreshQuotaSource = async name => {
   const status = $(`q-${name}-status`) || $(`p-${name}-status`);
   status.textContent = "正在触发一次手动刷新…";
   try {
-    const j = await api("/api/quota/refresh", {
+    const cliSource = ["claude", "codex"].includes(name);
+    const j = await api(
+      cliSource
+        ? "/api/provider-config/detect-credential"
+        : "/api/quota/refresh",
+      {
       method:"POST",
-      body: JSON.stringify({ tool: name }),
+      body: JSON.stringify(cliSource ? { source: name } : { tool: name }),
     });
-    status.textContent = j.message || "已触发手动刷新";
-    setTimeout(refresh, 500);
+    if (cliSource) renderProviderConfig(j);
+    const updated = $(`q-${name}-status`) || $(`p-${name}-status`);
+    if (updated) {
+      updated.textContent = j.message || (
+        cliSource ? "已重新检测 CLI 登录态" : "已触发手动刷新"
+      );
+    }
+    await refresh();
   } catch (e) {
     status.textContent = e.message;
     alert("刷新失败: " + e.message);
   }
-};
-
-window.clearQuotaSource = async name => {
-  if (!confirm(`清空 ${PROVIDER_NAMES[name] || name} OAuth Access Token 并停用该来源？`)) return;
-  const payload = {
-    quota_sources: { [name]: {
-      enabled: false,
-      access_token: "",
-      account_id: "",
-    } },
-  };
-  try {
-    const j = await api("/api/provider-config", {
-      method:"POST",
-      body: JSON.stringify(payload),
-    });
-    renderProviderConfig(j);
-    await refresh();
-  } catch (e) { alert("清空失败: " + e.message); }
-};
-
-window.clearCodexAccountId = async () => {
-  if (!confirm("清空 Codex Account ID？OAuth Access Token 保持不变。")) return;
-  try {
-    const j = await api("/api/provider-config", {
-      method:"POST",
-      body: JSON.stringify({ quota_sources: { codex: { account_id: "" } } }),
-    });
-    renderProviderConfig(j);
-    await refresh();
-  } catch (e) { alert("清空失败: " + e.message); }
 };
 
 function renderProcesses(processes) {
@@ -515,6 +497,11 @@ function render(s) {
     el.title = `${qi.detail}（来源: ${qi.source}）`;
   }
   $("quotaGrid").innerHTML = quotaCards(s.quota);
+  const limitIds = $("codexLimitIds");
+  if (limitIds) {
+    limitIds.innerHTML = ((s.quota.codex || {}).available_models || [])
+      .map(id => `<option value="${esc(id)}"></option>`).join("");
+  }
   const active = s.tasks.filter(t => ["queued","running","waiting_quota","paused"].includes(t.state));
   const hist = s.tasks.filter(t => ["succeeded","failed","cancelled"].includes(t.state)).reverse();
   $("activeBody").innerHTML = active.map(t => `<tr>

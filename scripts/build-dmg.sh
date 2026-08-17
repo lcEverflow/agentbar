@@ -7,6 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/dist"
 TEMP_ROOT="${TMPDIR:-/tmp}"
 TEMP_ROOT="${TEMP_ROOT%/}"
+if [[ -z "$TEMP_ROOT" ]]; then TEMP_ROOT="/"; fi
 PY2APP_VERSION="${AGENTBAR_PY2APP_VERSION:-0.28.10}"
 UV_BIN="$(command -v uv || true)"
 
@@ -57,34 +58,74 @@ if [[ "$VERSION" != "$PROJECT_VERSION" ]]; then
 fi
 echo "==> AgentBar v$VERSION"
 
-BUILD_VENV=$(/usr/bin/mktemp -d "$TEMP_ROOT/agentbar-build-venv.XXXXXX")
-BUILD_LOG=$(/usr/bin/mktemp "$TEMP_ROOT/agentbar-py2app.XXXXXX.log")
-REQUIREMENTS=$(/usr/bin/mktemp "$TEMP_ROOT/agentbar-requirements.XXXXXX.txt")
+BUILD_VENV=""
+BUILD_LOG=""
+REQUIREMENTS=""
 SMOKE_DIR=""
 STAGE=""
 DMG_WORK=""
-APP_BACKUP=""
+PUBLISH_STAGE=""
+PUBLISH_BACKUP=""
+FINAL_APP="$DIST/AgentBar.app"
+DMG_NAME="AgentBar-$VERSION.dmg"
+FINAL_DMG="$DIST/$DMG_NAME"
+OLD_APP_BACKED_UP=false
+OLD_DMG_BACKED_UP=false
+NEW_APP_PUBLISHED=false
+NEW_DMG_PUBLISHED=false
+PUBLISH_COMPLETE=false
+PRESERVE_PUBLISH_BACKUP=false
 
 cleanup() {
-  /bin/rm -rf -- "$BUILD_VENV"
-  /bin/rm -f -- "$BUILD_LOG" "$REQUIREMENTS"
+  # Publishing is a two-artifact transaction. If either final rename failed or
+  # the build was interrupted between them, restore the exact previous pair.
+  if [[ "$PUBLISH_COMPLETE" != true ]]; then
+    if [[ "$NEW_APP_PUBLISHED" == true ]]; then
+      /bin/rm -rf -- "$FINAL_APP"
+    fi
+    if [[ "$NEW_DMG_PUBLISHED" == true ]]; then
+      /bin/rm -f -- "$FINAL_DMG"
+    fi
+    if [[ "$OLD_APP_BACKED_UP" == true \
+      && ( -e "$PUBLISH_BACKUP/AgentBar.app" \
+        || -L "$PUBLISH_BACKUP/AgentBar.app" ) ]]; then
+      if ! /bin/mv "$PUBLISH_BACKUP/AgentBar.app" "$FINAL_APP"; then
+        echo "严重：无法恢复上一版 AgentBar.app: $PUBLISH_BACKUP/AgentBar.app" >&2
+        PRESERVE_PUBLISH_BACKUP=true
+      fi
+    fi
+    if [[ "$OLD_DMG_BACKED_UP" == true \
+      && ( -e "$PUBLISH_BACKUP/$DMG_NAME" \
+        || -L "$PUBLISH_BACKUP/$DMG_NAME" ) ]]; then
+      if ! /bin/mv "$PUBLISH_BACKUP/$DMG_NAME" "$FINAL_DMG"; then
+        echo "严重：无法恢复上一版 DMG: $PUBLISH_BACKUP/$DMG_NAME" >&2
+        PRESERVE_PUBLISH_BACKUP=true
+      fi
+    fi
+  fi
+  if [[ -n "$BUILD_VENV" ]]; then /bin/rm -rf -- "$BUILD_VENV"; fi
+  if [[ -n "$BUILD_LOG" ]]; then /bin/rm -f -- "$BUILD_LOG"; fi
+  if [[ -n "$REQUIREMENTS" ]]; then /bin/rm -f -- "$REQUIREMENTS"; fi
   if [[ -n "$SMOKE_DIR" ]]; then /bin/rm -rf -- "$SMOKE_DIR"; fi
   if [[ -n "$STAGE" ]]; then /bin/rm -rf -- "$STAGE"; fi
   if [[ -n "$DMG_WORK" ]]; then /bin/rm -rf -- "$DMG_WORK"; fi
+  if [[ -n "$PUBLISH_STAGE" ]]; then /bin/rm -rf -- "$PUBLISH_STAGE"; fi
+  if [[ -n "$PUBLISH_BACKUP" && "$PRESERVE_PUBLISH_BACKUP" != true ]]; then
+    /bin/rm -rf -- "$PUBLISH_BACKUP"
+  fi
   /bin/rm -rf -- "$ROOT/packaging/build" "$ROOT/packaging/dist" \
     "$ROOT/packaging/.eggs" "$ROOT/packaging/__pycache__"
-  if [[ -n "$APP_BACKUP" && -d "$APP_BACKUP" ]]; then
-    if [[ ! -e "$DIST/AgentBar.app" ]]; then
-      /bin/mv "$APP_BACKUP" "$DIST/AgentBar.app" || true
-    else
-      /bin/rm -rf -- "$APP_BACKUP"
-    fi
-  fi
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Install cleanup before the first allocation: if a later mktemp fails, every
+# earlier temporary path is still reclaimed by the EXIT trap.
+BUILD_VENV=$(/usr/bin/mktemp -d "$TEMP_ROOT/agentbar-build-venv.XXXXXX")
+BUILD_LOG=$(/usr/bin/mktemp "$TEMP_ROOT/agentbar-py2app.XXXXXX.log")
+REQUIREMENTS=$(/usr/bin/mktemp "$TEMP_ROOT/agentbar-requirements.XXXXXX.txt")
 
 echo "==> 创建隔离构建环境: $PYFW"
 "$PYFW" -m venv "$BUILD_VENV"
@@ -128,26 +169,9 @@ AGENTBAR_STATE_DIR="$SMOKE_DIR" \
 /bin/rm -rf -- "$SMOKE_DIR"
 SMOKE_DIR=""
 
-# Publish the already-verified app while retaining the previous known-good app
-# until the final rename succeeds.
-/bin/mkdir -p "$DIST"
-if [[ -e "$DIST/AgentBar.app" ]]; then
-  APP_BACKUP="$DIST/.AgentBar.app.previous.$$"
-  /bin/rm -rf -- "$APP_BACKUP"
-  /bin/mv "$DIST/AgentBar.app" "$APP_BACKUP"
-fi
-if ! /bin/mv "$CANDIDATE_APP" "$DIST/AgentBar.app"; then
-  echo "错误：无法发布新 AgentBar.app" >&2
-  exit 1
-fi
-if [[ -n "$APP_BACKUP" ]]; then
-  /bin/rm -rf -- "$APP_BACKUP"
-  APP_BACKUP=""
-fi
-
 echo "==> 生成并校验 DMG"
 STAGE=$(/usr/bin/mktemp -d "$TEMP_ROOT/agentbar-dmg-stage.XXXXXX")
-/usr/bin/ditto "$DIST/AgentBar.app" "$STAGE/AgentBar.app"
+/usr/bin/ditto "$CANDIDATE_APP" "$STAGE/AgentBar.app"
 /bin/ln -s /Applications "$STAGE/Applications"
 /bin/cat > "$STAGE/安装说明.txt" <<'EOF'
 AgentBar 安装：
@@ -162,13 +186,37 @@ AgentBar 安装：
 EOF
 
 DMG_WORK=$(/usr/bin/mktemp -d "$TEMP_ROOT/agentbar-dmg-output.XXXXXX")
-DMG_NAME="AgentBar-$VERSION.dmg"
 /usr/bin/hdiutil create -volname AgentBar -srcfolder "$STAGE" \
   -format UDZO "$DMG_WORK/$DMG_NAME" -quiet
 /usr/bin/hdiutil verify "$DMG_WORK/$DMG_NAME" -quiet
-/bin/mv -f "$DMG_WORK/$DMG_NAME" "$DIST/$DMG_NAME"
 
-SIZE=$(/usr/bin/du -h "$DIST/$DMG_NAME" | /usr/bin/cut -f1)
-SHA256=$(/usr/bin/shasum -a 256 "$DIST/$DMG_NAME" | /usr/bin/cut -d ' ' -f1)
-echo "==> 完成: $DIST/$DMG_NAME ($SIZE)"
+# Stage both verified artifacts on the destination filesystem, then replace the
+# public pair together. The EXIT trap rolls back both names after any failure.
+/bin/mkdir -p "$DIST"
+PUBLISH_STAGE=$(/usr/bin/mktemp -d "$DIST/.agentbar-publish.XXXXXX")
+PUBLISH_BACKUP=$(/usr/bin/mktemp -d "$DIST/.agentbar-publish-backup.XXXXXX")
+/bin/mv "$CANDIDATE_APP" "$PUBLISH_STAGE/AgentBar.app"
+/bin/mv "$DMG_WORK/$DMG_NAME" "$PUBLISH_STAGE/$DMG_NAME"
+/usr/bin/codesign --verify --deep --strict "$PUBLISH_STAGE/AgentBar.app"
+/usr/bin/hdiutil verify "$PUBLISH_STAGE/$DMG_NAME" -quiet
+
+SIZE=$(/usr/bin/du -h "$PUBLISH_STAGE/$DMG_NAME" | /usr/bin/cut -f1)
+SHA256=$(/usr/bin/shasum -a 256 "$PUBLISH_STAGE/$DMG_NAME" | /usr/bin/cut -d ' ' -f1)
+
+if [[ -e "$FINAL_APP" || -L "$FINAL_APP" ]]; then
+  OLD_APP_BACKED_UP=true
+  /bin/mv "$FINAL_APP" "$PUBLISH_BACKUP/AgentBar.app"
+fi
+if [[ -e "$FINAL_DMG" || -L "$FINAL_DMG" ]]; then
+  OLD_DMG_BACKED_UP=true
+  /bin/mv "$FINAL_DMG" "$PUBLISH_BACKUP/$DMG_NAME"
+fi
+
+NEW_APP_PUBLISHED=true
+/bin/mv "$PUBLISH_STAGE/AgentBar.app" "$FINAL_APP"
+NEW_DMG_PUBLISHED=true
+/bin/mv "$PUBLISH_STAGE/$DMG_NAME" "$FINAL_DMG"
+PUBLISH_COMPLETE=true
+
+echo "==> 完成: $FINAL_DMG ($SIZE)"
 echo "SHA-256: $SHA256"

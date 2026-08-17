@@ -63,9 +63,18 @@ def test_dmg_build_uses_locked_dependencies_and_cleans_temporary_outputs():
     assert '"$UV_BIN" export' in build
     assert "--locked" in build
     assert "trap cleanup EXIT" in build
+    assert build.index("trap cleanup EXIT") < build.index(
+        'BUILD_VENV=$(/usr/bin/mktemp'
+    )
     assert "--bundle-smoke" in build
     assert "hdiutil verify" in build
     assert "codesign --verify" in build
+    assert 'ditto "$CANDIDATE_APP" "$STAGE/AgentBar.app"' in build
+    assert 'ditto "$DIST/AgentBar.app"' not in build
+    assert "PUBLISH_STAGE" in build
+    assert "PUBLISH_BACKUP" in build
+    assert "PUBLISH_COMPLETE=true" in build
+    assert build.index("hdiutil verify") < build.index("NEW_APP_PUBLISHED=true")
 
 
 def test_release_version_sources_match():
@@ -73,7 +82,29 @@ def test_release_version_sources_match():
     init_text = (ROOT / "agentbar" / "__init__.py").read_text(encoding="utf-8")
     match = re.search(r'__version__ = "([^"]+)"', init_text)
     assert match is not None
-    assert match.group(1) == project["project"]["version"]
+    version = match.group(1)
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+    assert version == project["project"]["version"]
+
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked_project_versions = [
+        package.get("version")
+        for package in lock.get("package", [])
+        if package.get("name") == "agentbar"
+        and package.get("source", {}).get("editable") == "."
+    ]
+    assert locked_project_versions == [version]
+
+
+def test_readme_documents_cli_credential_and_fallback_boundaries():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "claude auth status --json" in readme
+    assert "不读取 Keychain" in readme
+    assert "legal-and-compliance#authentication-and-credential-use" in readme
+    assert "codex app-server" in readme
+    assert "experimental" in readme
+    assert "不读取 `auth.json` 兜底" in readme
+    assert "不内置、复制或修改 Claude Code / Codex CLI" in readme
 
 
 def test_py2app_declares_lazy_runtime_dependencies():
