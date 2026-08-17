@@ -1,3 +1,3 @@
 """AgentBar — macOS menu bar scheduler for AI CLI agents."""
 
-__version__ = "0.10.4"
+__version__ = "0.10.5"

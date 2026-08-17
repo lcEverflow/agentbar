@@ -30,7 +30,7 @@ macOS 状态栏（Menu Bar）AI Agent 调度器 —— 让 Claude Code、Codex �
 | 串行 / 有限并行 | `max_parallel`（默认 1 串行）+ `per_tool_limit` |
 | 完整生命周期 | queued / running / succeeded / failed / **waiting_quota** / paused / cancelled |
 | 额度耗尽不判失败 | 识别限流报错 → `waiting_quota`，解析恢复时间或指数退避，**自动 resume 原会话续跑** |
-| 额度状态可见（不伪造） | 额度来源显式 opt-in；手动选择 Claude 模型家族或 Codex `metered_feature`，输入 OAuth Access Token 后才请求 |
+| 额度状态可见（不伪造） | 额度来源显式 opt-in；Codex 可选 `limitId`，两种 CLI 登录态都自动检测，无需复制 Token；不支持时显示未知而非猜测 |
 | 可控制刷新 | 默认只在启动、保存配置或手动点击时请求一次；任务结束不再强制刷新全部来源，重复点击会合并 |
 | 菜单栏双环额度图标 | 外圈 Claude、内圈 Codex 用量一眼可见（同 aiusagebar 的外围圈样式），不用点开菜单；环心徽标显示调度状态（实心点=运行中、双竖条=已暂停），菜单栏只有这一个图标；模板图自适配深浅色；无可信数据只画轨道不编造 |
 | 键盘快捷键 | 面板/对话窗口前台时：`⌃W`/`⌘W` 关闭当前窗口，`⌃Q`/`⌘Q` 退出（走完整清理：停隧道/调度器/服务器） |
@@ -77,6 +77,10 @@ AppKit/WebKit/登录/二维码/Markdown 模块、内置 Web 资源及 DMG 完整
 架构跟随构建机（Apple Silicon 产出 arm64，Intel 产出 x86_64），当前不生成
 Universal 2 包。
 
+AgentBar.app 不内置、复制或修改 Claude Code / Codex CLI。需要使用对应任务或
+额度状态时，请另行安装并登录官方 CLI；App 会沿用 `tool_paths`、当前 `PATH`，
+以及 launchd 场景下登录 shell 能解析到的绝对路径。
+
 启动后点菜单栏 🤖 →「打开任务面板」，或：
 
 ```bash
@@ -115,21 +119,23 @@ uv run agentbar pause / resume / cancel <id> / log <id>
 | ⚠️ full | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
 
 - **full 档默认禁用**：需在 `~/.agentbar/config.json` 设 `allow_full_profile: true` 并重启，UI 中也有显式警告。
-- API 所有写操作都要求 AgentBar token，并校验 Host 头防 DNS rebinding；手动额度凭据只接受本机回环地址提交，避免经局域网明文传输。
-- OAuth Token / Account ID 是只写字段：Web、状态快照、菜单调试文件均只返回“是否已配置”；落盘的 `config.json` 权限固定为 `0600`。
+- API 所有写操作都要求 AgentBar token，并校验 Host 头防 DNS rebinding；企业 Cookie 只接受本机回环地址提交，避免经局域网明文传输。
+- Claude/Codex 的 OAuth Token 与 Account ID 不进入 AgentBar 配置、Web API、状态快照或日志。Codex 额度由官方 App Server 代查；Claude 只调用 `claude auth status --json` 检测登录状态，不读取 Keychain 或登录文件。
 - 子进程以 argv 数组直接 exec，无 shell 拼接；prompt 走 stdin，杜绝 flag 注入。
 - 每个任务独立进程组，取消/超时（默认 2h）时整组终止，不留孤儿进程。
 
 ## 额度状态的数据来源（诚实降级）
 
-订阅版 CLI 没有承诺稳定的公开额度查询 API。AgentBar 因此只请求用户显式配置的来源，任何一种拿不到都如实降级：
+AgentBar 只在用户显式启用来源后查询，任何一种拿不到都如实降级：
 
-1. **usage API**（显式配置）：Claude / Codex 默认关闭。在「额度设置」中启用来源、选择额度模型，并输入对应的 **OAuth Access Token** 后才会请求。Codex 可选填 Account ID。普通 Anthropic/OpenAI API key 不等于订阅 usage 凭据，接口拒绝时会如实显示错误。
+1. **CLI 登录态（自动）**：Claude / Codex 默认关闭。在「额度设置」中启用来源即可，无需填写密钥；Codex 还可从已发现的 `limitId` 中选择模型专属额度，留空则使用默认账户窗口。
+   - Codex 通过官方 [`codex app-server`](https://developers.openai.com/codex/app-server) 的 stdio 接口尝试调用 `account/read` 与 `account/rateLimits/read`；OAuth Token、Account ID、`auth.json` 内容都不会暴露给 AgentBar。该命令目前仍由 Codex 标记为 **experimental**，AgentBar 会先做运行时能力探测；CLI 过旧、方法不存在、响应异常或超时时，立即结束短生命周期探测进程并降级为「未知」/observed，不读取 `auth.json` 兜底。API-key-only 登录不提供 ChatGPT 订阅额度，界面会如实提示。
+   - Claude 只通过官方 `claude auth status --json` 检测登录状态，不读取或代用 OAuth 凭据。按照 Anthropic 的[认证与凭据使用边界](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)，Claude 剩余额度只展示调度器观测到的真实限流/恢复状态及可选 `ccusage` 本地成本，不伪造百分比。
 2. **observed**：调度器自身观测的最近成功执行、真实限流和恢复时间；它会优先标记已确认的限流。
 3. **ccusage**（可选增强）：`npm i -g ccusage` 后补充 Claude 本地 5h 成本。
 4. 无任何可用数据时显示「未知」，并显示失败原因。**不会估算或编造百分比。**
 
-usage 响应不是稳定的公开契约，接口结构变化时会显示解析错误而非虚构数值。默认不周期轮询；如需显式开启：
+Codex App Server 是官方但仍属实验性的能力；契约变化或本机 CLI 状态不可用时会显示明确错误而非虚构数值。默认不周期轮询；如需显式开启：
 
 ```jsonc
 { "usage_auto_refresh": true, "usage_refresh_seconds": 120 }
@@ -181,18 +187,13 @@ agentbar.log   # 调度器日志
   "usage_auto_refresh": false, // false=默认手动；true=按上方间隔轮询
   "tool_paths": {},         // {"claude": "/abs/path"} 手动覆盖
   "title_provider": "claude",   // 状态栏标题显示哪个 provider 的用量：claude/codex/mytoken/tokenverse
-  "quota_sources": {       // 订阅额度：默认关闭，必须手动输入凭据
+  "quota_sources": {       // 订阅额度：默认关闭；探测 CLI 状态，但不把其凭据存入 AgentBar
     "claude": {
-      "enabled": false,
-      "model": "sonnet", // opus / sonnet；留空=账户通用窗口
-      "access_token": "", // OAuth Access Token，非普通 API key
-      "account_id": ""
+      "enabled": false    // 自动检测 Claude Code 登录；额度用 observed/ccusage
     },
     "codex": {
       "enabled": false,
-      "model": "",       // metered_feature；留空=账户总额度
-      "access_token": "", // ChatGPT OAuth Access Token
-      "account_id": ""    // 可选；JWT 不含账号时填写
+      "model": ""        // App Server limitId；留空=账户默认额度
     }
   },
   "providers": {            // 快手内部额度 provider（默认关闭，可在面板一键导入 Cookie）
@@ -263,7 +264,7 @@ bash -n scripts/*.sh # 安装、重启、卸载与 DMG 脚本语法
 
 ## 已知限制（当前版本）
 
-- usage 响应不是公开契约，接口结构变化时显示解析错误而非虚构数值。
+- Anthropic 未提供面向第三方的订阅剩余额度接口，因此 Claude 不显示猜测的百分比；Codex App Server 虽是官方接口但仍标记为 experimental，能力不可用时会诚实降级。
 - 修改 `config.json` 需重启生效（无热加载）。
 - 任务级依赖（A 完成才跑 B）未实现，当前是 FIFO + 并发上限。
 - Menu Bar 使用原生矢量双环图标，自动适配深浅色；没有可信额度数据时只画轨道。

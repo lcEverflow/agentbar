@@ -10,6 +10,18 @@ from agentbar.server import ApiServer, _load_web
 from conftest import wait_for
 
 
+@pytest.fixture(autouse=True)
+def _stub_cli_credential_status(monkeypatch):
+    """HTTP tests never probe the developer machine's real CLI login state."""
+    monkeypatch.setattr("agentbar.server.credential_status", lambda tool, **kwargs: {
+        "available": False,
+        "source": f"{tool}_cli",
+        "status": "not_logged_in",
+        "detail": "not logged in",
+        "needs_authorization": False,
+    })
+
+
 @pytest.fixture
 def api(core, settings):
     settings.port = 0  # 随机端口
@@ -533,11 +545,17 @@ def test_quota_refresh_endpoint_targets_only_enabled_source(api):
     assert code == 202 and j["ok"]
     assert refreshed == ["codex"]
 
+    srv.core.quota.provider_tools = lambda: ["mytoken"]
+    code, j = _call(srv, "/api/quota/refresh", "POST", s.token,
+                    {"tool": "mytoken"})
+    assert code == 202 and j["ok"]
+    assert refreshed == ["codex", "mytoken"]
+
     code, j = _call(srv, "/api/quota/refresh", "POST", s.token,
                     {"tool": "claude"})
     assert code == 400
-    assert "未启用" in j["error"]
-    assert refreshed == ["codex"]
+    assert "未检测到 Claude Code 登录态" in j["error"]
+    assert refreshed == ["codex", "mytoken"]
 
 
 def test_provider_config_endpoint_masks_cookie(api):
@@ -568,8 +586,13 @@ def test_provider_cookie_preview_never_echoes_raw_or_malformed_secret(api):
     assert secret not in json.dumps(payload)
 
 
-def test_provider_config_endpoint_masks_manual_quota_credentials(api):
+def test_provider_config_exposes_only_non_secret_cli_status(api, monkeypatch):
     srv, s = api
+    monkeypatch.setattr("agentbar.server.credential_status", lambda *a, **k: {
+        "available": True,
+        "source": "codex_app_server",
+        "status": "available",
+    })
     s.quota_sources["codex"].update({
         "enabled": True,
         "model": "codex_bengalfox",
@@ -582,8 +605,9 @@ def test_provider_config_endpoint_masks_manual_quota_credentials(api):
     assert source == {
         "enabled": True,
         "model": "codex_bengalfox",
-        "key_set": True,
-        "account_id_set": True,
+        "credential_available": True,
+        "credential_source": "codex_app_server",
+        "credential_status": "available",
     }
     serialized = json.dumps(j)
     assert "oauth-super-secret" not in serialized
@@ -598,6 +622,76 @@ def test_provider_config_endpoint_masks_manual_quota_credentials(api):
     assert "account-private-id" not in serialized_state
     assert "access_token" not in state["quota_source_config"]["codex"]
     assert "account_id" not in state["quota_source_config"]["codex"]
+
+
+def test_cli_credential_redetect_is_local_noninteractive_and_source_scoped(
+    api, monkeypatch,
+):
+    srv, settings = api
+    settings.quota_sources["codex"]["enabled"] = True
+    calls = []
+
+    def detect(tool, **kwargs):
+        calls.append((tool, kwargs))
+        return {
+            "available": True,
+            "source": "codex_app_server",
+            "status": "available",
+            "detail": "must not be returned",
+            "account_id": "must-not-leak",
+        }
+
+    monkeypatch.setattr("agentbar.server.credential_status", detect)
+    reloads = []
+    refreshes = []
+    srv.core.quota.reload_fetchers = lambda refresh=True: reloads.append(refresh)
+    srv.core.quota.refresh_now = refreshes.append
+
+    code, payload = _call(
+        srv,
+        "/api/provider-config/detect-credential",
+        "POST",
+        settings.token,
+        {"source": "codex"},
+    )
+
+    assert code == 200
+    assert calls and all(call[1]["allow_interactive"] is False for call in calls)
+    assert calls[0][1]["refresh"] is True
+    assert calls[0][1]["settings"] is settings
+    assert reloads == [False]
+    assert refreshes == ["codex"]
+    source = payload["quota_sources"]["codex"]
+    assert source["credential_available"] is True
+    assert source["credential_source"] == "codex_app_server"
+    assert set(source) == {
+        "enabled", "model", "credential_available",
+        "credential_source", "credential_status",
+    }
+    serialized = json.dumps(payload)
+    assert "must-not-leak" not in serialized
+    assert "must not be returned" not in serialized
+
+
+def test_cli_credential_redetect_rejects_secret_fields_before_detection(
+    api, monkeypatch,
+):
+    srv, settings = api
+    monkeypatch.setattr(
+        "agentbar.server.credential_status",
+        lambda *a, **k: pytest.fail("secret payload reached detector"),
+    )
+
+    code, payload = _call(
+        srv,
+        "/api/provider-config/detect-credential",
+        "POST",
+        settings.token,
+        {"source": "codex", "access_token": "must-not-save"},
+    )
+
+    assert code == 400
+    assert "不接受任何凭据" in payload["error"]
 
 
 def test_provider_config_save_reloads_fetchers(api):
@@ -638,6 +732,7 @@ def test_provider_config_save_reloads_fetchers(api):
         {"quota_sources": {"claude": {"model": ["sonnet"]}}},
         {"quota_sources": {"claude": {"access_token": {"token": "secret"}}}},
         {"quota_sources": {"codex": {"account_id": ["account"]}}},
+        {"access_token": "top-level-secret"},
         {"usage_auto_refresh": "false"},
         {"title_provider": {"name": "codex"}},
         {"title_provider": "unknown"},
@@ -669,8 +764,11 @@ def test_provider_config_rejects_malformed_known_fields_without_mutation(
     ) == before
 
 
-def test_provider_config_manual_source_model_roundtrip(api):
+def test_provider_config_cli_source_and_limit_id_roundtrip(api, monkeypatch):
     srv, s = api
+    monkeypatch.setattr("agentbar.server.credential_status", lambda *a, **k: {
+        "available": True, "source": "codex_app_server", "status": "available",
+    })
     reloaded = []
     srv.core.quota.reload_fetchers = lambda: reloaded.append(True)
     code, j = _call(srv, "/api/provider-config", "POST", s.token, {
@@ -678,8 +776,6 @@ def test_provider_config_manual_source_model_roundtrip(api):
             "codex": {
                 "enabled": True,
                 "model": "codex_bengalfox",
-                "access_token": "oauth-new-secret",
-                "account_id": "account-123",
             },
         },
         "usage_auto_refresh": False,
@@ -689,41 +785,34 @@ def test_provider_config_manual_source_model_roundtrip(api):
     assert s.quota_sources["codex"] == {
         "enabled": True,
         "model": "codex_bengalfox",
-        "access_token": "oauth-new-secret",
-        "account_id": "account-123",
     }
     assert s.usage_auto_refresh is False
     assert s.title_provider == "codex"
     assert j["quota_sources"]["codex"] == {
         "enabled": True,
         "model": "codex_bengalfox",
-        "key_set": True,
-        "account_id_set": True,
+        "credential_available": True,
+        "credential_source": "codex_app_server",
+        "credential_status": "available",
     }
-    assert "oauth-new-secret" not in json.dumps(j)
-    assert "account-123" not in json.dumps(j)
     assert reloaded == [True]
 
 
-def test_provider_config_accepts_legacy_api_key_but_only_persists_access_token(api):
+def test_provider_config_rejects_legacy_secret_payload_without_mutation(api):
     srv, s = api
-    srv.core.quota.reload_fetchers = lambda: None
+    before = json.loads(json.dumps(s.quota_sources))
     code, j = _call(srv, "/api/provider-config", "POST", s.token, {
         "quota_sources": {
             "claude": {
-                "enabled": True,
-                "model": "sonnet",
                 "api_key": "legacy-client-token",
             },
         },
     })
-    assert code == 200, j
-    assert s.quota_sources["claude"]["access_token"] == "legacy-client-token"
-    assert "api_key" not in s.quota_sources["claude"]
+    assert code == 400, j
+    assert s.quota_sources == before
     serialized = json.dumps(j)
     assert "legacy-client-token" not in serialized
-    assert "access_token" not in j["quota_sources"]["claude"]
-    assert "api_key" not in j["quota_sources"]["claude"]
+    assert "API 不接收任何密钥" in j["error"]
 
 
 def test_provider_config_is_direct_local_only_even_through_loopback_proxy(api):
@@ -799,6 +888,16 @@ def test_cookie_import_and_debug_dispatch_are_direct_local_only(api, monkeypatch
     assert code == 403
     assert imported == []
 
+    code, _ = _call(
+        srv,
+        "/api/provider-config/detect-credential",
+        "POST",
+        s.token,
+        {"source": "codex"},
+        host=tunnel_host,
+    )
+    assert code == 403
+
     seen = []
     srv.hooks["dispatch"] = seen.append
     code, _ = _call(
@@ -848,10 +947,7 @@ def test_provider_config_persistence_failure_returns_503_without_secret_echo(
     )
 
     code, payload = _call(srv, "/api/provider-config", "POST", settings.token, {
-        "quota_sources": {"claude": {
-            "enabled": True,
-            "access_token": "must-not-echo",
-        }},
+        "title_provider": "mytoken",
     })
 
     assert code == 503
@@ -861,8 +957,11 @@ def test_provider_config_persistence_failure_returns_503_without_secret_echo(
     assert settings.quota_sources == before
 
 
-def test_provider_config_omitted_manual_secret_preserves_existing(api):
+def test_provider_config_save_removes_existing_legacy_secrets(api, monkeypatch):
     srv, s = api
+    monkeypatch.setattr("agentbar.server.credential_status", lambda *a, **k: {
+        "available": True, "source": "codex_app_server", "status": "available",
+    })
     s.quota_sources["codex"].update({
         "enabled": True,
         "model": "old-model",
@@ -879,14 +978,11 @@ def test_provider_config_omitted_manual_secret_preserves_existing(api):
     assert s.quota_sources["codex"] == {
         "enabled": True,
         "model": "new-model",
-        "access_token": "keep-this-secret",
-        "account_id": "keep-this-account",
     }
-    assert j["quota_sources"]["codex"]["key_set"] is True
-    assert j["quota_sources"]["codex"]["account_id_set"] is True
+    assert j["quota_sources"]["codex"]["credential_available"] is True
 
 
-def test_provider_config_explicit_blank_clears_disabled_source(api):
+def test_provider_config_rejects_blank_legacy_secret_fields(api):
     srv, s = api
     s.quota_sources["claude"].update({
         "enabled": True,
@@ -904,32 +1000,32 @@ def test_provider_config_explicit_blank_clears_disabled_source(api):
             },
         },
     })
-    assert code == 200, j
-    assert s.quota_sources["claude"]["enabled"] is False
-    assert s.quota_sources["claude"]["access_token"] == ""
-    assert s.quota_sources["claude"]["account_id"] == ""
-    assert j["quota_sources"]["claude"]["key_set"] is False
-    assert j["quota_sources"]["claude"]["account_id_set"] is False
+    assert code == 400, j
+    assert s.quota_sources["claude"]["enabled"] is True
+    assert s.quota_sources["claude"]["access_token"] == "remove-this-secret"
 
 
-def test_provider_config_rejects_enabling_source_with_blank_secret(api):
+def test_provider_config_saves_enabled_source_while_cli_is_logged_out(
+    api, monkeypatch,
+):
     srv, s = api
+    monkeypatch.setattr("agentbar.server.credential_status", lambda *a, **k: {
+        "available": False, "source": "claude_cli", "status": "not_logged_in",
+    })
     reloaded = []
     srv.core.quota.reload_fetchers = lambda: reloaded.append(True)
     code, j = _call(srv, "/api/provider-config", "POST", s.token, {
         "quota_sources": {
             "claude": {
                 "enabled": True,
-                "model": "sonnet",
-                "access_token": "",
             },
         },
     })
-    assert code == 400
-    assert "必须输入" in j["error"]
-    assert s.quota_sources["claude"]["enabled"] is False
-    assert s.quota_sources["claude"]["access_token"] == ""
-    assert reloaded == []
+    assert code == 200
+    assert s.quota_sources["claude"]["enabled"] is True
+    assert j["quota_sources"]["claude"]["credential_available"] is False
+    assert j["quota_sources"]["claude"]["credential_status"] == "not_logged_in"
+    assert reloaded == [True]
 
 
 def test_provider_cookie_import_updates_config(api, monkeypatch):
@@ -1046,4 +1142,11 @@ def test_desktop_editor_uses_adapter_capabilities_instead_of_hardcoded_lists():
     assert "const presets = info.models || []" in html
     assert "const efforts = info.efforts || []" in html
     assert "sonnet\", \"opus\", \"fable" not in html
-    assert "clearCodexAccountId" in html
+    assert "clearCodexAccountId" not in html
+    assert "q-codex-account" not in html
+    assert "sourceSecret" not in html
+    assert "Codex 额度由 CLI App Server" in html
+    assert "可选 limitId" in html
+    assert 'cliSource ? { source: name } : { tool: name }' in html
+    assert '"/api/provider-config/detect-credential"' in html
+    assert '"/api/quota/refresh"' in html

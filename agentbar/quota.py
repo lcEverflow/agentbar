@@ -1,7 +1,8 @@
 """Quota status — honest, layered; never fabricated.
 
 数据优先级（来源在 UI 明确标注，取不到就降级，绝不编造）：
-  1. usage API   — 用户显式配置的 Claude OAuth usage / Codex wham usage；
+  1. CLI source  — 用户启用后自动检测 Claude Code 登录态，并通过 Codex
+                   App Server 的账户接口读取其可用额度；
                    默认仅启动、保存设置或手动点击时请求，周期刷新需主动开启
   2. observed    — 调度器观测事实：真实任务的限流失败（ground truth，优先于 API 展示）
   3. ccusage     — 本机装了 ccusage 时补充 5h 窗口成本
@@ -25,7 +26,7 @@ from .usage import UsageSnapshot, get_usage_fetchers
 
 log = logging.getLogger("agentbar.quota")
 
-USAGE_STALE_SECONDS = 15 * 60  # usage API 结果超过该时长视为过期，不再参与判定
+USAGE_STALE_SECONDS = 15 * 60  # 额度来源结果超过该时长视为过期，不再参与判定
 # MyToken's token-unit fetch can perform three sequential 12s HTTP calls. Give
 # the active request enough time to reach its own bounded timeout before stop()
 # reports a lifecycle failure.
@@ -37,7 +38,7 @@ class QuotaStatus:
     tool: str
     state: str          # "ok" | "limited" | "unknown"
     detail: str
-    source: str         # "usage_api" | "observed" | "ccusage" | "none" 或组合
+    source: str         # fetcher source | "observed" | "ccusage" | "none" 或组合
     reset_at: float | None = None
     windows: list = field(default_factory=list)   # [{label, used_percent, resets_at}]
     plan: str | None = None
@@ -127,10 +128,7 @@ class QuotaMonitor:
         fields. Unknown/testing fetchers fall back to object identity so replacing
         one is conservatively treated as a real configuration change.
         """
-        names = (
-            "access_token", "api_key", "account_id", "model",
-            "cookie", "unit", "refresh_seconds",
-        )
+        names = ("binary", "model", "cookie", "unit", "refresh_seconds")
         values = tuple((name, getattr(fetcher, name)) for name in names if hasattr(fetcher, name))
         return (type(fetcher), values if values else id(fetcher))
 
@@ -248,7 +246,7 @@ class QuotaMonitor:
         lq, ls = o.get("last_quota_at") or 0, o.get("last_success_at") or 0
         if lq > ls and o.get("reset_at"):
             candidates.append(o["reset_at"])
-        # usage API 显示某窗口已打满 → 主动冷却到重置时间（不用真跑一次失败）
+        # 额度来源显示某窗口已打满 → 主动冷却到重置时间（不用真跑一次失败）
         if snap and not snap.error and now - snap.fetched_at < USAGE_STALE_SECONDS:
             for w in snap.windows:
                 # 一个 snapshot 可能同时含账户通用窗口和多个模型专属窗口。
@@ -295,7 +293,8 @@ class QuotaMonitor:
                 tool,
                 "limited" if limited else "ok",
                 " · ".join(parts),
-                "usage_api" + ("+observed" if observed_limited else ""),
+                (snap.source or "quota_source")
+                + ("+observed" if observed_limited else ""),
                 reset_at=worst_reset or (obs_reset if observed_limited else None),
             )
         elif observed_limited:
@@ -307,6 +306,17 @@ class QuotaMonitor:
                                  "observed")
         elif ls:
             st = QuotaStatus(tool, "ok", f"正常（{_clock_day(ls)} 有成功执行）", "observed")
+        elif snap and not snap.error and snap.source == "claude_auth_status":
+            # Claude exposes a supported non-sensitive CLI login-status command,
+            # but no supported third-party subscription-usage endpoint. Preserve
+            # that useful distinction instead of presenting a logged-in source as
+            # an unexplained fetch failure or inventing a percentage.
+            st = QuotaStatus(
+                tool,
+                "unknown",
+                "Claude Code 已登录；订阅额度仅展示任务观测与 ccusage",
+                "claude_auth_status",
+            )
         else:
             st = QuotaStatus(tool, "unknown", "未知（尚无额度数据）", "none")
 
@@ -332,7 +342,7 @@ class QuotaMonitor:
             if snap and snap.windows:
                 st.detail += f"；上次刷新失败：{refresh_error.error}"
             elif st.source == "none":
-                st.detail += f"；usage API: {refresh_error.error}"
+                st.detail += f"；额度来源: {refresh_error.error}"
         if cc:
             st.detail += f"；5h 已用 ${cc['cost']:.2f}（ccusage）"
             st.source += "+ccusage"
@@ -523,7 +533,7 @@ class QuotaMonitor:
                     snap = fetcher.fetch()
                 except Exception as e:  # 任何异常都不能带崩后台线程
                     log.warning("usage fetch %s failed: %s", tool, e)
-                    snap = UsageSnapshot(tool, source="usage_api", error=str(e))
+                    snap = UsageSnapshot(tool, source="quota_source", error=str(e))
                 if snap:
                     with self._lock:
                         # 配置切换/禁用时丢弃旧请求的迟到结果，避免把 A 模型数字误标为 B。

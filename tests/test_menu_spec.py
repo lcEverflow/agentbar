@@ -58,8 +58,8 @@ def test_pause_resume_toggle():
 def test_quota_submenu_contents():
     now = time.time()
     spec = build_menu_spec(_snap(quota_source_config={
-        "claude": {"enabled": True, "key_set": True},
-        "codex": {"enabled": False, "key_set": False},
+        "claude": {"enabled": True, "credential_mode": "auto"},
+        "codex": {"enabled": False, "credential_mode": "auto"},
     }, quota={
         "claude": {"state": "limited",
                    "windows": [{"label": "5h", "used_percent": 100.0, "resets_at": now + 600},
@@ -68,7 +68,7 @@ def test_quota_submenu_contents():
                    "detail": "", "error": None},
         "codex": {"state": "unknown", "windows": [], "source": "none",
                   "fetched_at": None, "plan": None, "detail": "未知（尚无额度数据）",
-                  "error": "未读到 ~/.codex/auth.json（先运行 codex login）"},
+                  "error": "Codex CLI 尚未使用 ChatGPT 登录（请先运行 codex login）"},
     }))
     subs = [n for n in spec if n["kind"] == "submenu" and "手机访问" not in n["title"]]
     assert len(subs) == 2
@@ -76,17 +76,17 @@ def test_quota_submenu_contents():
     assert "100%" in claude["title"] or "5h 100%" in claude["title"]
     child_actions = [c["action"] for c in claude["children"] if c["kind"] == "action"]
     assert "refresh_quota:claude" in child_actions
-    # 手动 OAuth 模式不再提供 Keychain 授权入口。
+    # 菜单只触发来源级重检，不读取或展示 CLI 登录凭据。
     codex = subs[1]
     child_actions = [c["action"] for c in codex["children"] if c["kind"] == "action"]
     assert "authorize_keychain" not in child_actions
 
 
-def test_legacy_keychain_error_never_reintroduces_authorize_action():
+def test_cli_auth_error_never_introduces_credential_authorize_action():
     spec = build_menu_spec(_snap(quota={
         "claude": {"state": "unknown", "windows": [], "source": "none",
                    "fetched_at": None, "plan": None, "detail": "",
-                   "error": "未读到 Claude 凭据（Keychain 静默读取被拒？菜单里可手动授权）"},
+                   "error": "Claude Code 尚未登录（请先运行 claude auth login）"},
     }))
     sub = next(n for n in spec if n["kind"] == "submenu")
     child_actions = [c["action"] for c in sub["children"] if c["kind"] == "action"]
@@ -120,7 +120,7 @@ def test_unconfigured_corp_providers_stay_discoverable_in_menu():
 def test_quota_menu_shows_selected_model_and_refreshes_only_that_source():
     now = time.time()
     spec = build_menu_spec(_snap(quota_source_config={
-        "codex": {"enabled": True, "key_set": True, "model": "codex_bengalfox"},
+        "codex": {"enabled": True, "credential_mode": "auto", "model": "codex_bengalfox"},
     }, quota={
         "codex": {
             "state": "ok",
@@ -137,8 +137,8 @@ def test_quota_menu_shows_selected_model_and_refreshes_only_that_source():
     }))
     row = next(n for n in spec if n["kind"] == "submenu" and "Codex" in n["title"])
     assert "codex_bengalfox" in row["title"]
-    assert any("模型 codex_bengalfox" in child["title"] for child in row["children"])
-    assert any("可选额度标识 codex_bengalfox" in child["title"] for child in row["children"])
+    assert any("limitId codex_bengalfox" in child["title"] for child in row["children"])
+    assert any("可选 limitId codex_bengalfox" in child["title"] for child in row["children"])
     actions = [child.get("action") for child in row["children"]]
     assert "refresh_quota:codex" in actions
     assert "refresh_quota:claude" not in actions
@@ -147,7 +147,7 @@ def test_quota_menu_shows_selected_model_and_refreshes_only_that_source():
 
 def test_stale_quota_is_labeled_in_menu_instead_of_looking_current():
     spec = build_menu_spec(_snap(quota_source_config={
-        "codex": {"enabled": True, "key_set": True},
+        "codex": {"enabled": True, "credential_mode": "auto"},
     }, quota={
         "codex": {
             "state": "unknown",
@@ -165,14 +165,8 @@ def test_stale_quota_is_labeled_in_menu_instead_of_looking_current():
     assert any("数据已过期" in child["title"] for child in row["children"])
 
 
-@pytest.mark.parametrize(
-    "source_cfg",
-    [
-        {"enabled": False, "key_set": True, "model": "sonnet"},
-        {"enabled": True, "key_set": False, "model": "sonnet"},
-    ],
-)
-def test_observed_quota_for_unconfigured_source_has_setup_but_no_refresh(source_cfg):
+def test_observed_quota_for_unconfigured_source_has_setup_but_no_refresh():
+    source_cfg = {"enabled": False, "credential_mode": "auto"}
     spec = build_menu_spec(_snap(
         quota_source_config={"claude": source_cfg},
         quota={
@@ -194,14 +188,13 @@ def test_observed_quota_for_unconfigured_source_has_setup_but_no_refresh(source_
     assert "refresh_quota:claude" not in actions
 
 
-def test_disabled_manual_quota_sources_stay_discoverable_without_refresh():
+def test_disabled_auto_quota_sources_stay_discoverable_without_refresh():
     spec = build_menu_spec(_snap(quota_source_config={
-        "claude": {"enabled": False, "key_set": False, "model": ""},
+        "claude": {"enabled": False, "credential_mode": "auto", "model": ""},
         "codex": {
             "enabled": False,
-            "key_set": True,
+            "credential_mode": "auto",
             "model": "codex_bengalfox",
-            "account_id_set": True,
         },
     }))
     rows = [
@@ -212,7 +205,7 @@ def test_disabled_manual_quota_sources_stay_discoverable_without_refresh():
     assert len(rows) == 2
     claude = next(row for row in rows if "Claude" in row["title"])
     codex = next(row for row in rows if "Codex" in row["title"])
-    assert "未配置" in claude["title"]
+    assert "未启用" in claude["title"]
     assert "未启用" in codex["title"]
     assert "codex_bengalfox" in codex["title"]
     for row in rows:
@@ -221,18 +214,16 @@ def test_disabled_manual_quota_sources_stay_discoverable_without_refresh():
         assert not any(str(action).startswith("refresh_quota:") for action in actions)
 
 
-def test_enabled_manual_quota_source_waiting_row_can_refresh_only_itself():
+def test_enabled_auto_quota_source_waiting_row_can_redetect_only_itself():
     spec = build_menu_spec(_snap(quota_source_config={
         "claude": {
             "enabled": True,
-            "key_set": True,
-            "model": "sonnet",
-            "account_id_set": False,
+            "credential_mode": "auto",
         },
     }))
     row = next(n for n in spec if n["kind"] == "submenu" and "Claude" in n["title"])
     assert "等待刷新" in row["title"]
-    assert "sonnet" in row["title"]
+    assert "limitId" not in row["title"]
     actions = [child.get("action") for child in row["children"]]
     assert "refresh_quota:claude" in actions
     assert "refresh_quota:codex" not in actions

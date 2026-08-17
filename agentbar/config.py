@@ -15,25 +15,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_PORT = 8737
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 LEGACY_CLAUDE_CREDENTIAL_CACHE = "claude_credentials.json"
 LEGACY_CLAUDE_CREDENTIAL_TEMP = "claude_credentials.tmp"
 
-# Claude/Codex 订阅额度默认不读取本机登录态。用户必须在额度设置中
-# 显式启用、选择模型并输入 OAuth access token。这样未配置的来源不会读 Keychain、
-# 不会扫描 CLI 凭据，也不会发起网络请求。
+# 额度来源默认关闭。Claude 只提供 CLI 登录状态（无官方第三方
+# 订阅额度 API）；Codex 通过官方 App Server 获取可选 limitId。配置中
+# 绝不保存两者的 OAuth token 或 account id。
 DEFAULT_QUOTA_SOURCES: dict = {
-    "claude": {
-        "enabled": False,
-        "model": "",
-        "access_token": "",
-        "account_id": "",
-    },
+    "claude": {"enabled": False},
     "codex": {
         "enabled": False,
         "model": "",
-        "access_token": "",
-        "account_id": "",
     },
 }
 
@@ -98,7 +91,7 @@ def _merge_providers(user: dict | None) -> dict:
 
 
 def _merge_quota_sources(user: dict | None) -> dict:
-    """Return canonical quota-source config and migrate legacy ``api_key``."""
+    """Return the token-free v3 quota-source configuration."""
     merged = copy.deepcopy(DEFAULT_QUOTA_SOURCES)
     user = user if isinstance(user, dict) else {}
     for name, defaults in merged.items():
@@ -107,34 +100,15 @@ def _merge_quota_sources(user: dict | None) -> dict:
             enabled = override.get("enabled")
             defaults["enabled"] = enabled if isinstance(enabled, bool) else False
 
-            for key, max_len in (("model", 160), ("account_id", 256)):
-                value = override.get(key)
-                defaults[key] = (
+            if name == "codex":
+                value = override.get("model")
+                defaults["model"] = (
                     value.strip()
                     if isinstance(value, str)
-                    and len(value) <= max_len
+                    and len(value) <= 160
                     and not any(char in value for char in "\r\n\x00")
                     else ""
                 )
-
-            # v0.10.3 预发布配置曾把 OAuth token 误称为 api_key。
-            # 新字段缺失时无损迁移；显式 access_token 始终优先。
-            token = (
-                override.get("access_token")
-                if "access_token" in override
-                else override.get("api_key")
-            )
-            defaults["access_token"] = (
-                token.strip()
-                if isinstance(token, str)
-                and len(token) <= 16_384
-                and not any(char in token for char in "\r\n\x00")
-                else ""
-            )
-            # Invalid/missing credentials must never leave an enabled source
-            # that crashes fetcher construction or repeatedly reports errors.
-            if defaults["enabled"] and not defaults["access_token"]:
-                defaults["enabled"] = False
     return merged
 
 
@@ -165,7 +139,7 @@ class Settings:
     token: str = ""
     # 快手内部额度 provider 配置（见 DEFAULT_PROVIDERS）；cookie 空 / enabled=False 则不拉取。
     providers: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_PROVIDERS))
-    # Claude/Codex 额度查询：显式选择来源/模型，并配置 OAuth access token。
+    # Claude CLI 登录状态 / Codex App Server 额度；不持久化 OAuth 凭据。
     quota_sources: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_QUOTA_SOURCES))
     # 菜单栏标题显示哪个 provider 的用量百分比：claude / codex / mytoken / tokenverse
     title_provider: str = "claude"
@@ -348,7 +322,8 @@ def _load_settings_holding_file_lock(
 
     raw_sources = data.get("quota_sources")
     legacy_quota_key = isinstance(raw_sources, dict) and any(
-        isinstance(source, dict) and "api_key" in source
+        isinstance(source, dict)
+        and bool({"api_key", "access_token", "account_id"} & set(source))
         for source in raw_sources.values()
     )
     changed = bool(
@@ -474,6 +449,9 @@ def save_settings(s: Settings) -> None:
     # ``s._lock``, and reversing the order would deadlock against such a caller
     # while another thread is doing a plain save.
     with s._lock, _SAVE_LOCK:
+        # Never persist legacy credentials even if an older UI/client mutates a
+        # Settings object in memory before calling save.
+        s.quota_sources = _merge_quota_sources(s.quota_sources)
         cfg = s.config_path
         cfg.parent.mkdir(parents=True, exist_ok=True)
         lock_path = cfg.with_name(".config.lock")

@@ -11,16 +11,11 @@ def test_quota_source_defaults_are_explicit_opt_in(tmp_path):
     settings = load_settings(tmp_path / "state")
     assert settings.usage_auto_refresh is False
     assert set(settings.quota_sources) == {"claude", "codex"}
-    for source in settings.quota_sources.values():
-        assert source == {
-            "enabled": False,
-            "model": "",
-            "access_token": "",
-            "account_id": "",
-        }
+    assert settings.quota_sources["claude"] == {"enabled": False}
+    assert settings.quota_sources["codex"] == {"enabled": False, "model": ""}
 
 
-def test_quota_source_model_and_secret_roundtrip_in_private_config(tmp_path):
+def test_quota_source_model_roundtrip_drops_legacy_secrets(tmp_path):
     state_dir = tmp_path / "state"
     settings = load_settings(state_dir)
     settings.quota_sources["codex"].update({
@@ -36,9 +31,9 @@ def test_quota_source_model_and_secret_roundtrip_in_private_config(tmp_path):
     assert persisted["quota_sources"]["codex"] == {
         "enabled": True,
         "model": "codex_bengalfox",
-        "access_token": "oauth-secret",
-        "account_id": "account-123",
     }
+    assert "oauth-secret" not in settings.config_path.read_text(encoding="utf-8")
+    assert "account-123" not in settings.config_path.read_text(encoding="utf-8")
 
     loaded = load_settings(state_dir)
     assert loaded.quota_sources["codex"] == persisted["quota_sources"]["codex"]
@@ -55,7 +50,7 @@ def test_config_temp_file_is_private_before_atomic_replace(tmp_path, monkeypatch
         return real_replace(source, destination)
 
     monkeypatch.setattr(os, "replace", checked_replace)
-    settings.quota_sources["claude"]["access_token"] = "private-oauth-token"
+    settings.title_provider = "codex"
     save_settings(settings)
 
     assert seen_modes == [0o600]
@@ -86,25 +81,33 @@ def test_quota_source_load_discards_unknown_sources_and_fields(tmp_path):
     assert loaded.quota_sources["codex"] == {
         "enabled": True,
         "model": "future-model-id",
-        "access_token": "secret",
-        "account_id": "account",
     }
     assert "unexpected" not in loaded.quota_sources["codex"]
 
 
-def test_legacy_api_key_is_migrated_once_and_removed(tmp_path):
+def test_legacy_quota_credentials_and_claude_model_are_removed(tmp_path):
     state_dir = tmp_path / "state"
     settings = load_settings(state_dir)
     payload = json.loads(settings.config_path.read_text(encoding="utf-8"))
-    payload["quota_sources"]["claude"].pop("access_token")
+    existing_admin_token = payload["token"]
+    payload["config_schema_version"] = 2
     payload["quota_sources"]["claude"]["api_key"] = "legacy-oauth-token"
+    payload["quota_sources"]["claude"]["access_token"] = "legacy-access-token"
+    payload["quota_sources"]["claude"]["account_id"] = "legacy-account"
+    payload["quota_sources"]["claude"]["model"] = "opus"
+    payload["quota_sources"]["claude"]["enabled"] = True
     settings.config_path.write_text(json.dumps(payload), encoding="utf-8")
 
     loaded = load_settings(state_dir)
-    assert loaded.quota_sources["claude"]["access_token"] == "legacy-oauth-token"
+    assert loaded.quota_sources["claude"] == {"enabled": True}
+    assert loaded.token == existing_admin_token
     persisted = json.loads(loaded.config_path.read_text(encoding="utf-8"))
-    assert persisted["quota_sources"]["claude"]["access_token"] == "legacy-oauth-token"
-    assert "api_key" not in persisted["quota_sources"]["claude"]
+    assert persisted["config_schema_version"] == 3
+    assert persisted["quota_sources"]["claude"] == {"enabled": True}
+    serialized = json.dumps(persisted)
+    assert "legacy-oauth-token" not in serialized
+    assert "legacy-access-token" not in serialized
+    assert "legacy-account" not in serialized
 
 
 def test_concurrent_saves_do_not_share_a_temporary_file(tmp_path):
@@ -424,16 +427,11 @@ def test_nested_provider_and_quota_values_are_canonicalized(tmp_path):
         "refresh_seconds": 60,
     }
     assert loaded.quota_sources["claude"] == {
-        "enabled": False,
-        "model": "",
-        "access_token": "",
-        "account_id": "",
+        "enabled": True,
     }
     assert loaded.quota_sources["codex"] == {
         "enabled": True,
         "model": "model-id",
-        "access_token": "oauth-token",
-        "account_id": "",
     }
     persisted = json.loads(loaded.config_path.read_text(encoding="utf-8"))
     assert persisted["providers"] == loaded.providers
@@ -452,7 +450,7 @@ def test_legacy_lan_default_is_migrated_to_loopback_once(tmp_path):
     assert loaded.lan_access is False
     assert loaded.token != "old-token"
     persisted = json.loads(loaded.config_path.read_text(encoding="utf-8"))
-    assert persisted["config_schema_version"] == 2
+    assert persisted["config_schema_version"] == 3
     assert persisted["lan_access"] is False
     assert persisted["token"] == loaded.token
 
@@ -480,7 +478,7 @@ def test_non_migrating_client_load_does_not_rotate_live_legacy_token(tmp_path):
     server = load_settings(state_dir)
     assert server.token != legacy["token"]
     assert server.lan_access is False
-    assert json.loads(config_path.read_text(encoding="utf-8"))["config_schema_version"] == 2
+    assert json.loads(config_path.read_text(encoding="utf-8"))["config_schema_version"] == 3
 
 
 def test_non_migrating_client_load_does_not_rewrite_or_backup_damage(tmp_path):

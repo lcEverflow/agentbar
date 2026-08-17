@@ -31,6 +31,7 @@ from .config import (
     save_settings,
 )
 from .scheduler import Scheduler
+from .usage import credential_status
 
 log = logging.getLogger("agentbar.server")
 
@@ -166,10 +167,74 @@ def _cookie_preview(cookie: str) -> str:
     return shown + (" ..." if len(names) > 4 else "")
 
 
-def _provider_config_payload(settings: Settings) -> dict:
+_CREDENTIAL_STATUSES = {
+    "available",
+    "not_logged_in",
+    "authorization_required",
+    "expired",
+    "invalid_credentials",
+    "api_key_unsupported",
+    "unavailable",
+    "missing",
+    "unsupported",
+    "timeout",
+    "error",
+}
+
+
+def _quota_credential_diagnostic(
+    source: str, *, settings: Settings | None = None, refresh: bool = False,
+) -> dict:
+    """Return a strictly non-secret view of local CLI authentication state."""
+    try:
+        raw = credential_status(
+            source,
+            settings=settings,
+            allow_interactive=False,
+            refresh=refresh,
+        )
+    except Exception:
+        log.exception("%s CLI credential detection failed", source)
+        raw = {}
+    status = str(raw.get("status") or "unavailable")
+    if status not in _CREDENTIAL_STATUSES:
+        status = "unavailable"
+    detected_source = str(raw.get("source") or "none")
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", detected_source):
+        detected_source = "unknown"
+    return {
+        "credential_available": bool(raw.get("available")) and status == "available",
+        "credential_source": detected_source,
+        "credential_status": status,
+    }
+
+
+def _credential_action_message(source: str, diagnostic: dict) -> str:
+    name = "Claude Code" if source == "claude" else "Codex CLI"
+    status = diagnostic.get("credential_status")
+    if status == "api_key_unsupported":
+        return (
+            "Codex CLI 当前是 API key 登录，无法提供 ChatGPT 订阅额度；"
+            "请在 Codex CLI 中登录 ChatGPT 账户后重新检测。"
+        )
+    if status in {"expired", "invalid_credentials"}:
+        return f"{name} 登录态已失效；请在对应 CLI 中重新登录后再检测。"
+    if status == "timeout":
+        return f"{name} 登录态检测超时；请确认 CLI 可正常运行后重试。"
+    if status in {"unsupported", "unavailable", "error"}:
+        return f"无法检测 {name} 登录态；请确认 CLI 已安装并可正常运行。"
+    return f"未检测到 {name} 登录态；请先在对应 CLI 中完成登录，再重新检测。"
+
+
+def _provider_config_payload(settings: Settings, *, refresh_credentials=False) -> dict:
+    with settings._lock:
+        saved_providers = json.loads(json.dumps(settings.providers or {}))
+        saved_sources = json.loads(json.dumps(settings.quota_sources or {}))
+        usage_auto_refresh = bool(settings.usage_auto_refresh)
+        title_provider = settings.title_provider
     providers = {}
     for name, defaults in DEFAULT_PROVIDERS.items():
-        cfg = (settings.providers or {}).get(name) or {}
+        cfg = saved_providers.get(name) or {}
         cookie = str(cfg.get("cookie") or "")
         providers[name] = {
             "enabled": bool(cfg.get("enabled")),
@@ -184,19 +249,19 @@ def _provider_config_payload(settings: Settings) -> dict:
         "providers": providers,
         "quota_sources": {
             name: {
-                "enabled": bool(((settings.quota_sources or {}).get(name) or {}).get("enabled")),
-                "model": str(((settings.quota_sources or {}).get(name) or {}).get("model") or ""),
-                "key_set": bool(str(
-                    ((settings.quota_sources or {}).get(name) or {}).get("access_token") or ""
-                ).strip()),
-                "account_id_set": bool(str(
-                    ((settings.quota_sources or {}).get(name) or {}).get("account_id") or ""
-                ).strip()),
+                "enabled": bool((saved_sources.get(name) or {}).get("enabled")),
+                **(
+                    {"model": str((saved_sources.get(name) or {}).get("model") or "")}
+                    if name == "codex" else {}
+                ),
+                **_quota_credential_diagnostic(
+                    name, settings=settings, refresh=refresh_credentials,
+                ),
             }
             for name in DEFAULT_QUOTA_SOURCES
         },
-        "usage_auto_refresh": bool(settings.usage_auto_refresh),
-        "title_provider": settings.title_provider,
+        "usage_auto_refresh": usage_auto_refresh,
+        "title_provider": title_provider,
     }
 
 
@@ -207,6 +272,28 @@ def _apply_provider_settings(
 ) -> None:
     if not isinstance(payload, dict):
         raise ValueError("配置请求必须是 JSON object")
+    unknown_top_level = set(payload) - {
+        "providers", "quota_sources", "usage_auto_refresh", "title_provider",
+    }
+    if unknown_top_level:
+        raise ValueError(f"未知配置字段: {sorted(unknown_top_level)[0]!r}")
+    source_payload = payload.get("quota_sources", {})
+    if not isinstance(source_payload, dict):
+        raise ValueError("quota_sources 必须是 JSON object")
+    unknown_sources = set(source_payload) - set(DEFAULT_QUOTA_SOURCES)
+    if unknown_sources:
+        raise ValueError(f"未知 quota source: {sorted(unknown_sources)[0]!r}")
+    for name, incoming in source_payload.items():
+        if not isinstance(incoming, dict):
+            raise ValueError(f"quota_sources.{name} 必须是 JSON object")
+        allowed = {"enabled"} if name == "claude" else {"enabled", "model"}
+        rejected = set(incoming) - allowed
+        if rejected:
+            field = sorted(rejected)[0]
+            raise ValueError(
+                f"quota_sources.{name}.{field} 不再接受；"
+                f"{name} 凭据由本机 CLI 自动检测，API 不接收任何密钥或账号字段"
+            )
     with settings._lock:
         providers = payload.get("providers", {})
         if not isinstance(providers, dict):
@@ -252,10 +339,11 @@ def _apply_provider_settings(
             }:
                 raise ValueError("title_provider 无效")
             next_title = title
-        source_payload = payload.get("quota_sources", {})
-        if not isinstance(source_payload, dict):
-            raise ValueError("quota_sources 必须是 JSON object")
         sources = json.loads(json.dumps(settings.quota_sources or DEFAULT_QUOTA_SOURCES))
+        for cfg in sources.values():
+            if isinstance(cfg, dict):
+                for legacy_secret in ("access_token", "api_key", "account_id"):
+                    cfg.pop(legacy_secret, None)
         for name, defaults in DEFAULT_QUOTA_SOURCES.items():
             incoming = source_payload.get(name)
             if incoming is None:
@@ -263,35 +351,16 @@ def _apply_provider_settings(
             if not isinstance(incoming, dict):
                 raise ValueError(f"quota_sources.{name} 必须是 JSON object")
             cfg = sources.setdefault(name, dict(defaults))
-            cfg.pop("api_key", None)  # 旧字段只读迁移，永不再落盘。
             if "enabled" in incoming:
                 cfg["enabled"] = _clean_bool_field(
                     incoming.get("enabled"), f"quota_sources.{name}.enabled",
                 )
-            if "model" in incoming:
-                cfg["model"] = _clean_credential_field(incoming.get("model"), "模型", 160)
-            token_submitted = "access_token" in incoming or "api_key" in incoming
-            if token_submitted:
-                # access_token 是唯一正式字段；api_key 仅接受旧 Web 客户端迁移。
-                raw_token = (
-                    incoming.get("access_token")
-                    if "access_token" in incoming
-                    else incoming.get("api_key")
+            if name == "codex" and "model" in incoming:
+                cfg["model"] = _clean_credential_field(
+                    incoming.get("model"), "Codex limitId", 160,
                 )
-                cfg["access_token"] = _clean_credential_field(
-                    raw_token, "OAuth Access Token", 16_384,
-                )
-            if "account_id" in incoming:
-                cfg["account_id"] = _clean_credential_field(
-                    incoming.get("account_id"), "Account ID", 256,
-                )
-            if token_submitted and not cfg.get("access_token"):
-                # 显式清空凭据时同时停用，避免留下会持续报错的半配置。
-                if incoming.get("enabled") is True:
-                    raise ValueError(f"{name} 启用前必须输入 OAuth Access Token")
-                cfg["enabled"] = False
-            if cfg.get("enabled") and not str(cfg.get("access_token") or "").strip():
-                raise ValueError(f"{name} 启用前必须输入 OAuth Access Token")
+            if name == "claude":
+                cfg.pop("model", None)
         next_auto_refresh = settings.usage_auto_refresh
         if "usage_auto_refresh" in payload:
             next_auto_refresh = _clean_bool_field(
@@ -724,6 +793,7 @@ def _make_handler(
             # a LAN hop only to receive a 403 after the bytes have been consumed.
             local_only = {
                 "/api/provider-config",
+                "/api/provider-config/detect-credential",
                 "/api/provider-config/import-cookie",
                 "/api/debug/dispatch",
             }
@@ -800,7 +870,18 @@ def _make_handler(
                     })
                     return
                 if tool not in core.quota.provider_tools():
-                    self._json(400, {"ok": False, "error": f"未启用的额度来源: {tool!r}"})
+                    if tool in DEFAULT_QUOTA_SOURCES:
+                        diagnostic = _quota_credential_diagnostic(
+                            tool, settings=settings,
+                        )
+                        error = (
+                            _credential_action_message(tool, diagnostic)
+                            if not diagnostic["credential_available"]
+                            else f"额度来源 {tool!r} 尚未启用，请先保存启用设置"
+                        )
+                    else:
+                        error = f"未启用的额度来源: {tool!r}"
+                    self._json(400, {"ok": False, "error": error})
                     return
                 try:
                     admission.require_open()
@@ -840,7 +921,57 @@ def _make_handler(
                     return
                 self._json(200, {
                     **_provider_config_payload(settings),
-                    "message": "额度配置已保存并刷新",
+                    "message": "额度配置已保存；已登录的来源将刷新，未登录来源保持待检测状态",
+                })
+                return
+            if path == "/api/provider-config/detect-credential":
+                if not self._trusted_local():
+                    self._json(403, {
+                        "ok": False,
+                        "error": "CLI 登录态检测仅允许本机直连",
+                    })
+                    return
+                if set(body) - {"source"}:
+                    self._json(400, {
+                        "ok": False,
+                        "error": "登录态检测只接受 source 字段，不接受任何凭据",
+                    })
+                    return
+                source = body.get("source")
+                if source not in DEFAULT_QUOTA_SOURCES:
+                    self._json(400, {
+                        "ok": False,
+                        "error": f"未知 quota source: {source!r}",
+                    })
+                    return
+                diagnostic = _quota_credential_diagnostic(
+                    source, settings=settings, refresh=True,
+                )
+                try:
+                    admission.require_open()
+                    core.quota.reload_fetchers(refresh=False)
+                except _AdmissionClosed:
+                    self._reject_if_stopping()
+                    return
+                with settings._lock:
+                    enabled = bool(
+                        ((settings.quota_sources or {}).get(source) or {}).get(
+                            "enabled"
+                        )
+                    )
+                refreshed = False
+                if diagnostic["credential_available"] and enabled:
+                    core.quota.refresh_now(source)
+                    refreshed = True
+                message = (
+                    f"{source} CLI 登录态已重新检测"
+                    + ("，额度刷新已触发" if refreshed else "")
+                    if diagnostic["credential_available"]
+                    else _credential_action_message(source, diagnostic)
+                )
+                self._json(200, {
+                    **_provider_config_payload(settings),
+                    "message": message,
                 })
                 return
             if path == "/api/provider-config/import-cookie":

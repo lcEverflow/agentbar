@@ -26,6 +26,23 @@ def test_unknown_without_observation(tmp_path):
     assert st.source == "none"
 
 
+def test_claude_logged_in_status_is_honest_without_fabricated_usage(tmp_path):
+    m = _m(tmp_path)
+    m._usage["claude"] = UsageSnapshot(
+        "claude",
+        plan="pro",
+        source="claude_auth_status",
+    )
+
+    st = m.status("claude")
+
+    assert st.state == "unknown"
+    assert st.source == "claude_auth_status"
+    assert st.windows == []
+    assert st.plan == "pro"
+    assert "任务观测" in st.detail
+
+
 def test_limited_then_ok(tmp_path):
     m = _m(tmp_path)
     reset = time.time() + 600
@@ -411,7 +428,6 @@ def test_reload_discards_result_from_previous_model_fetch(tmp_path):
     settings.quota_sources["codex"].update({
         "enabled": True,
         "model": "new-model",
-        "access_token": "new-access-token",
     })
     m.reload_fetchers(refresh=False)
     old.release.set()
@@ -483,12 +499,12 @@ def test_reload_refreshes_only_changed_sources_and_preserves_other_snapshot(
     m = _m(tmp_path)
 
     class _ConfiguredFetcher(_CountingFetcher):
-        def __init__(self, tool, access_token):
+        def __init__(self, tool, model):
             super().__init__(tool)
-            self.access_token = access_token
+            self.model = model
 
-    claude_old = _ConfiguredFetcher("claude", "same-token")
-    codex_old = _ConfiguredFetcher("codex", "old-token")
+    claude_old = _ConfiguredFetcher("claude", "account")
+    codex_old = _ConfiguredFetcher("codex", "old-limit")
     m._fetchers = {"claude": claude_old, "codex": codex_old}
     claude_snapshot = UsageSnapshot(
         "claude", windows=[UsageWindow("5h", 10)], source="test"
@@ -497,8 +513,8 @@ def test_reload_refreshes_only_changed_sources_and_preserves_other_snapshot(
         "claude": claude_snapshot,
         "codex": UsageSnapshot("codex", windows=[UsageWindow("5h", 20)], source="test"),
     }
-    claude_rebuilt = _ConfiguredFetcher("claude", "same-token")
-    codex_new = _ConfiguredFetcher("codex", "new-token")
+    claude_rebuilt = _ConfiguredFetcher("claude", "account")
+    codex_new = _ConfiguredFetcher("codex", "new-limit")
     monkeypatch.setattr(
         "agentbar.quota.get_usage_fetchers",
         lambda _settings: {"claude": claude_rebuilt, "codex": codex_new},
@@ -517,12 +533,27 @@ def test_reload_refreshes_only_changed_sources_and_preserves_other_snapshot(
     assert codex_new.calls == 1
 
 
-def test_reload_never_builds_fetcher_from_uncommitted_settings(tmp_path):
+def test_reload_never_builds_fetcher_from_uncommitted_settings(tmp_path, monkeypatch):
     settings = Settings(state_dir=tmp_path)
     settings.quota_sources["codex"].update({
         "enabled": True,
-        "access_token": "stable-token",
+        "model": "stable-limit",
     })
+    class _ModelFetcher:
+        tool = "codex"
+
+        def __init__(self, model):
+            self.model = model
+
+        def fetch(self):
+            return UsageSnapshot("codex", source="test", model=self.model)
+
+    monkeypatch.setattr(
+        "agentbar.quota.get_usage_fetchers",
+        lambda current: {
+            "codex": _ModelFetcher(current.quota_sources["codex"]["model"])
+        },
+    )
     m = QuotaMonitor(settings)
     transaction_open = threading.Event()
     release_transaction = threading.Event()
@@ -530,10 +561,10 @@ def test_reload_never_builds_fetcher_from_uncommitted_settings(tmp_path):
 
     def rolled_back_writer():
         with settings._lock:
-            settings.quota_sources["codex"]["access_token"] = "transient-token"
+            settings.quota_sources["codex"]["model"] = "transient-limit"
             transaction_open.set()
             assert release_transaction.wait(2)
-            settings.quota_sources["codex"]["access_token"] = "stable-token"
+            settings.quota_sources["codex"]["model"] = "stable-limit"
 
     writer = threading.Thread(target=rolled_back_writer)
     writer.start()
@@ -550,7 +581,7 @@ def test_reload_never_builds_fetcher_from_uncommitted_settings(tmp_path):
     reloader.join(timeout=2)
 
     assert reload_done.is_set()
-    assert m._fetchers["codex"].access_token == "stable-token"
+    assert m._fetchers["codex"].model == "stable-limit"
 
 
 def test_refresh_error_keeps_fresh_last_good_snapshot(tmp_path):

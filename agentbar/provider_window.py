@@ -1,8 +1,8 @@
 """Native quota-source settings window.
 
-Claude/Codex use manually supplied OAuth access tokens. MyToken/Tokenverse use
-corp browser cookies. Secret fields are always write-only: reopening the window
-shows only whether a credential is configured, never the credential itself.
+Claude/Codex credentials are discovered from their installed CLIs and never
+cross the UI boundary. MyToken/Tokenverse keep their explicit, write-only corp
+browser-cookie workflow.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from AppKit import (
     NSApp,
     NSBackingStoreBuffered,
     NSButton,
+    NSComboBox,
     NSFont,
     NSMakeRect,
     NSPopUpButton,
@@ -40,6 +41,7 @@ from .config import (
     PROVIDER_UNITS,
     save_settings,
 )
+from .usage import credential_status
 
 log = logging.getLogger("agentbar.provider_window")
 
@@ -98,10 +100,10 @@ class ProviderSettingsWindowController(NSObject):
         self._cookie = {}
         self._status = {}
         self._source_model = {}
-        self._source_key = {}
-        self._source_account = {}
-        self._source_account_clear = {}
         self._source_refresh_buttons = {}
+        self._credential_status = {}
+        self._credential_generations = {source: 0 for source in _QUOTA_SOURCES}
+        self._credential_lock = threading.Lock()
         self._import_buttons = {}
         self._chrome_buttons = {}
         self._chrome_logins = {}
@@ -156,7 +158,7 @@ class ProviderSettingsWindowController(NSObject):
 
         view.addSubview_(_label("订阅额度", PAD, H - 142, 220, 20, bold=True))
         view.addSubview_(_label(
-            "显式输入 OAuth Access Token；不会读取 Keychain 或 CLI 登录文件。",
+            "自动使用 Claude Code / Codex CLI 登录态；AgentBar 不接收或保存订阅凭据。",
             PAD + 84, H - 142, W - 2 * PAD - 84, 18, dim=True,
         ))
         self._build_quota_source_row(view, "claude", H - 235)
@@ -189,49 +191,37 @@ class ProviderSettingsWindowController(NSObject):
         view.addSubview_(status)
         self._status[source] = status
 
-        model_label = "额度模型" if source == "claude" else "metered_feature"
-        view.addSubview_(_label(model_label, PAD, y + 41, 105))
-        model = NSTextField.alloc().initWithFrame_(NSMakeRect(PAD + 108, y + 37, 245, 24))
-        model.setPlaceholderString_(
-            "opus / sonnet；留空=通用窗口"
-            if source == "claude"
-            else "留空=账户总额度；或填 metered_feature"
-        )
-        view.addSubview_(model)
-        self._source_model[source] = model
-
         if source == "codex":
-            view.addSubview_(_label("Account ID", PAD + 370, y + 41, 78))
-            account = NSTextField.alloc().initWithFrame_(
-                NSMakeRect(PAD + 450, y + 37, W - PAD * 2 - 450 - 82, 24)
+            view.addSubview_(_label("limitId", PAD, y + 41, 105))
+            model = NSComboBox.alloc().initWithFrame_(
+                NSMakeRect(PAD + 108, y + 37, W - 2 * PAD - 108, 24)
             )
-            account.setPlaceholderString_("可选；留空保留已配置值")
-            view.addSubview_(account)
-            self._source_account[source] = account
-            clear_account = _button(
-                "清 Account", W - PAD - 78, y + 36, 78,
-                self, "onClearAccount:", 26,
+            model.setCompletes_(True)
+            model.setNumberOfVisibleItems_(8)
+            model.setPlaceholderString_(
+                "留空=默认账户窗口；或填 App Server 返回的 limitId"
             )
-            clear_account.setRepresentedObject_(source)
-            view.addSubview_(clear_account)
-            self._source_account_clear[source] = clear_account
+            view.addSubview_(model)
+            self._source_model[source] = model
+        else:
+            view.addSubview_(_label(
+                "Anthropic 未提供第三方订阅额度接口；展示任务观测与 ccusage 数据。",
+                PAD, y + 41, W - 2 * PAD, 18, dim=True,
+            ))
 
-        view.addSubview_(_label("OAuth Access Token", PAD, y + 9, 126))
-        key = NSSecureTextField.alloc().initWithFrame_(
-            NSMakeRect(PAD + 130, y + 5, W - 2 * PAD - 130 - 174, 24)
+        hint = (
+            "仅检测 Claude Code 登录状态，不读取 Keychain 或 OAuth 凭据"
+            if source == "claude"
+            else "额度由 Codex CLI app-server 自动提供，凭据不会暴露给 AgentBar"
         )
-        key.setPlaceholderString_("留空保留已配置的 Access Token")
-        view.addSubview_(key)
-        self._source_key[source] = key
-
-        refresh = _button("刷新此来源", W - PAD - 166, y + 4, 92, self, "onRefreshSource:", 26)
+        view.addSubview_(_label(hint, PAD, y + 10, W - 2 * PAD - 190, 18, dim=True))
+        refresh = _button(
+            "重新检测 / 刷新", W - PAD - 176, y + 4, 176,
+            self, "onRefreshSource:", 26,
+        )
         refresh.setRepresentedObject_(source)
         view.addSubview_(refresh)
         self._source_refresh_buttons[source] = refresh
-
-        clear = _button("清空", W - PAD - 68, y + 4, 68, self, "onClearSource:", 26)
-        clear.setRepresentedObject_(source)
-        view.addSubview_(clear)
 
     def _build_provider_row(self, view, provider: str, y: int):
         name = _NAMES[provider]
@@ -305,34 +295,33 @@ class ProviderSettingsWindowController(NSObject):
             self.title_popup.selectItemAtIndex_(1)
 
         self.auto_refresh_check.setState_(1 if usage_auto_refresh else 0)
+        try:
+            available_limit_ids = (
+                ((self.core.snapshot().get("quota") or {}).get("codex") or {}).get(
+                    "available_models"
+                ) or []
+            )
+        except Exception:
+            available_limit_ids = []
+        codex_model = self._source_model.get("codex")
+        if codex_model is not None:
+            codex_model.removeAllItems()
+            codex_model.addItemsWithObjectValues_([
+                str(value)[:160]
+                for value in available_limit_ids
+                if isinstance(value, str) and value.strip()
+            ])
         for source in _QUOTA_SOURCES:
             defaults = DEFAULT_QUOTA_SOURCES[source]
             cfg = quota_sources[source] or defaults
             self._enabled[source].setState_(1 if cfg.get("enabled") else 0)
-            self._source_model[source].setStringValue_(str(cfg.get("model") or ""))
-            # Credentials are write-only. Empty controls mean "keep existing" on save.
-            self._source_key[source].setStringValue_("")
-            account = self._source_account.get(source)
-            if account is not None:
-                account.setStringValue_("")
-            key_set = bool(str(cfg.get("access_token") or "").strip())
-            if key_set:
-                state = "OAuth Access Token 已配置"
-                if source == "codex" and str(cfg.get("account_id") or "").strip():
-                    state += " · Account ID 已配置"
-                if not cfg.get("enabled"):
-                    state += " · 已停用"
-            elif cfg.get("enabled"):
-                state = "已启用，但缺少 OAuth Access Token"
-            else:
-                state = "未配置 OAuth Access Token"
-            self._status[source].setStringValue_(state)
-            self._source_refresh_buttons[source].setEnabled_(
-                bool(cfg.get("enabled") and key_set)
-            )
-            account_clear = self._source_account_clear.get(source)
-            if account_clear is not None:
-                account_clear.setEnabled_(bool(str(cfg.get("account_id") or "").strip()))
+            model = self._source_model.get(source)
+            if model is not None:
+                model.setStringValue_(str(cfg.get("model") or ""))
+            self._status[source].setStringValue_("正在静默检测 CLI 登录态…")
+            self._source_refresh_buttons[source].setTitle_("检测中…")
+            self._source_refresh_buttons[source].setEnabled_(False)
+            self._start_credential_check(source)
 
         for provider in _PROVIDERS:
             defaults = DEFAULT_PROVIDERS[provider]
@@ -356,88 +345,109 @@ class ProviderSettingsWindowController(NSObject):
                 state = "未配置 Cookie"
             self._status[provider].setStringValue_(state)
 
+    @objc.python_method
+    def _credential_detector(self):
+        """Use an injected monitor detector in tests, otherwise the safe resolver."""
+        return getattr(self.core.quota, "credential_status", credential_status)
+
+    @objc.python_method
+    def _start_credential_check(
+        self, source: str, *, refresh: bool = False,
+    ) -> None:
+        if source not in _QUOTA_SOURCES:
+            return
+        with self._credential_lock:
+            self._credential_generations[source] += 1
+            generation = self._credential_generations[source]
+        detector = self._credential_detector()
+
+        def work():
+            try:
+                result = detector(
+                    source,
+                    settings=self.settings,
+                    allow_interactive=False,
+                    refresh=bool(refresh),
+                )
+            except Exception:
+                log.exception("%s credential detection failed", source)
+                result = {
+                    "available": False,
+                    "source": "none",
+                    "status": "unavailable",
+                    "detail": "登录态检测失败，请确认 CLI 已安装并重新登录。",
+                    "needs_authorization": False,
+                }
+            refreshed = False
+            if refresh and bool(result.get("available")):
+                self.core.quota.reload_fetchers(refresh=False)
+                with self.settings._lock:
+                    enabled = bool(
+                        ((self.settings.quota_sources or {}).get(source) or {}).get(
+                            "enabled"
+                        )
+                    )
+                if enabled:
+                    self.core.quota.refresh_now(source)
+                    refreshed = True
+            AppHelper.callAfter(
+                self._finish_credential_check,
+                source,
+                generation,
+                result,
+                refresh,
+                refreshed,
+            )
+
+        threading.Thread(
+            target=work,
+            name=f"agentbar-credential-{source}",
+            daemon=True,
+        ).start()
+
+    @objc.python_method
+    def _finish_credential_check(
+        self, source, generation, result, requested_refresh, refreshed,
+    ) -> None:
+        with self._credential_lock:
+            if generation != self._credential_generations.get(source):
+                return
+        safe = {
+            "available": bool(result.get("available")),
+            "source": str(result.get("source") or "none")[:80],
+            "status": str(result.get("status") or "unavailable")[:80],
+            "detail": str(result.get("detail") or "")[:400],
+            "needs_authorization": bool(result.get("needs_authorization")),
+        }
+        self._credential_status[source] = safe
+        suffix = " · 已停用" if not self._enabled[source].state() else ""
+        self._status[source].setStringValue_(
+            (safe["detail"] or "未检测到可用 CLI 登录态") + suffix
+        )
+        button = self._source_refresh_buttons[source]
+        button.setTitle_("重新检测 / 刷新")
+        button.setEnabled_(True)
+        if requested_refresh:
+            if refreshed:
+                message = f"{_NAMES[source]}：已重新检测登录态并触发额度刷新。"
+            elif safe["available"]:
+                message = f"{_NAMES[source]}：已检测到登录态；启用并保存后可刷新额度。"
+            else:
+                message = safe["detail"] or (
+                    f"未检测到 {_NAMES[source]} 登录态，请先在对应 CLI 中登录。"
+                )
+            self._message.setStringValue_(message)
+
     def onRefreshSource_(self, sender):
         source = str(sender.representedObject() or "")
-        with self.settings._lock:
-            cfg = dict((self.settings.quota_sources or {}).get(source) or {})
-        if source not in _QUOTA_SOURCES or not cfg.get("enabled") or not str(
-            cfg.get("access_token") or ""
-        ).strip():
-            self._message.setStringValue_("请先保存并启用该来源的 OAuth Access Token。")
+        if source not in _QUOTA_SOURCES:
             return
-        self.core.quota.refresh_now(source)
-        self._message.setStringValue_(f"{_NAMES[source]}：已触发一次手动额度刷新。")
-
-    def onClearSource_(self, sender):
-        source = str(sender.representedObject() or "")
-        if source not in DEFAULT_QUOTA_SOURCES:
-            return
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_(f"清空 {_NAMES[source]} OAuth Access Token？")
-        alert.setInformativeText_("将删除 AgentBar 保存的 Access Token 和 Account ID，并停用该额度来源。")
-        alert.addButtonWithTitle_("清空")
-        alert.addButtonWithTitle_("取消")
-        if alert.runModal() != NSAlertFirstButtonReturn:
-            return
-        try:
-            with self.settings._lock:
-                old_sources = copy.deepcopy(self.settings.quota_sources)
-                try:
-                    cfg = self.settings.quota_sources.setdefault(
-                        source, dict(DEFAULT_QUOTA_SOURCES[source])
-                    )
-                    cfg["access_token"] = ""
-                    cfg["account_id"] = ""
-                    cfg["enabled"] = False
-                    save_settings(self.settings)
-                except Exception:
-                    self.settings.quota_sources = old_sources
-                    raise
-        except Exception:
-            log.exception("failed to clear %s quota credential", source)
-            self._reload_controls()
-            self._alert("无法清空额度凭据", "配置文件写入失败，原设置未更改。")
-            return
-        # Clearing disables the source; rebuild without issuing unrelated
-        # requests. There is nothing useful to refresh for the cleared source.
-        self.core.quota.reload_fetchers(refresh=False)
-        self._reload_controls()
-        self._message.setStringValue_(f"{_NAMES[source]} OAuth Access Token 已清空并停用。")
-
-    def onClearAccount_(self, sender):
-        source = str(sender.representedObject() or "")
-        if source != "codex":
-            return
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("清空 Codex Account ID？")
-        alert.setInformativeText_("OAuth Access Token 和额度来源开关保持不变。")
-        alert.addButtonWithTitle_("清空")
-        alert.addButtonWithTitle_("取消")
-        if alert.runModal() != NSAlertFirstButtonReturn:
-            return
-        try:
-            with self.settings._lock:
-                old_sources = copy.deepcopy(self.settings.quota_sources)
-                try:
-                    cfg = self.settings.quota_sources.setdefault(
-                        source, dict(DEFAULT_QUOTA_SOURCES[source])
-                    )
-                    cfg["account_id"] = ""
-                    save_settings(self.settings)
-                    ready = bool(cfg.get("enabled") and cfg.get("access_token"))
-                except Exception:
-                    self.settings.quota_sources = old_sources
-                    raise
-        except Exception:
-            log.exception("failed to clear Codex account id")
-            self._reload_controls()
-            self._alert("Account ID 清空失败", "配置文件写入失败，原设置未更改。")
-            return
-        self.core.quota.reload_fetchers(refresh=False)
-        if ready:
-            self.core.quota.refresh_now(source)
-        self._reload_controls()
-        self._message.setStringValue_("Codex Account ID 已清空；Access Token 保持不变。")
+        sender.setEnabled_(False)
+        sender.setTitle_("正在检测…")
+        self._message.setStringValue_(
+            f"正在重新检测 {_NAMES[source]} CLI 登录态…"
+        )
+        self._start_credential_check(source, refresh=True)
 
     def onChromeLogin_(self, sender):
         provider = str(sender.representedObject() or "")
@@ -616,22 +626,14 @@ class ProviderSettingsWindowController(NSObject):
         try:
             for source in _QUOTA_SOURCES:
                 enabled = bool(self._enabled[source].state())
-                model = self._validated_field(
-                    self._source_model[source], "额度模型", 160
+                model_control = self._source_model.get(source)
+                model = (
+                    self._validated_field(model_control, "Codex limitId", 160)
+                    if model_control is not None else ""
                 )
-                typed_key = self._validated_field(
-                    self._source_key[source], "OAuth Access Token", 16_384
-                )
-                account = ""
-                if source == "codex":
-                    account = self._validated_field(
-                        self._source_account[source], "Codex Account ID", 256
-                    )
                 source_inputs[source] = {
                     "enabled": enabled,
                     "model": model,
-                    "typed_key": typed_key,
-                    "account_id": account,
                 }
             for provider in _PROVIDERS:
                 defaults = DEFAULT_PROVIDERS[provider]
@@ -673,7 +675,18 @@ class ProviderSettingsWindowController(NSObject):
                 old_title = self.settings.title_provider
                 old_auto_refresh = self.settings.usage_auto_refresh
                 before_sources = {
-                    source: dict((old_sources or {}).get(source) or {})
+                    source: {
+                        "enabled": bool(
+                            ((old_sources or {}).get(source) or {}).get("enabled")
+                        ),
+                        **(
+                            {"model": str(
+                                ((old_sources or {}).get(source) or {}).get("model")
+                                or ""
+                            )}
+                            if source == "codex" else {}
+                        ),
+                    }
                     for source in _QUOTA_SOURCES
                 }
                 before_providers = {
@@ -682,26 +695,16 @@ class ProviderSettingsWindowController(NSObject):
                 }
                 try:
                     for source, update in source_inputs.items():
-                        current = (self.settings.quota_sources or {}).get(source) or {}
-                        effective_key = update["typed_key"] or str(
-                            current.get("access_token") or ""
-                        ).strip()
-                        if update["enabled"] and not effective_key:
-                            raise ValueError(
-                                f"{_NAMES[source]} 启用前必须输入 OAuth Access Token"
-                            )
-
-                    for source, update in source_inputs.items():
                         cfg = self.settings.quota_sources.setdefault(
                             source, dict(DEFAULT_QUOTA_SOURCES[source])
                         )
+                        for legacy_secret in ("access_token", "api_key", "account_id"):
+                            cfg.pop(legacy_secret, None)
                         cfg["enabled"] = update["enabled"]
-                        cfg["model"] = update["model"]
-                        # Empty credential controls preserve the saved write-only value.
-                        if update["typed_key"]:
-                            cfg["access_token"] = update["typed_key"]
-                        if source == "codex" and update["account_id"]:
-                            cfg["account_id"] = update["account_id"]
+                        if source == "codex":
+                            cfg["model"] = update["model"]
+                        else:
+                            cfg.pop("model", None)
 
                     for provider, update in provider_inputs.items():
                         cfg = self.settings.providers.setdefault(
@@ -727,7 +730,21 @@ class ProviderSettingsWindowController(NSObject):
                 changed = [
                     source for source in _QUOTA_SOURCES
                     if before_sources[source]
-                    != dict((self.settings.quota_sources or {}).get(source) or {})
+                    != {
+                        "enabled": bool(
+                            ((self.settings.quota_sources or {}).get(source) or {}).get(
+                                "enabled"
+                            )
+                        ),
+                        **(
+                            {"model": str(
+                                ((self.settings.quota_sources or {}).get(source) or {}).get(
+                                    "model"
+                                ) or ""
+                            )}
+                            if source == "codex" else {}
+                        ),
+                    }
                 ]
                 changed.extend(
                     provider for provider in _PROVIDERS
@@ -738,9 +755,12 @@ class ProviderSettingsWindowController(NSObject):
                 for tool in changed:
                     if tool in _QUOTA_SOURCES:
                         cfg = (self.settings.quota_sources or {}).get(tool) or {}
-                        ready = cfg.get("enabled") and str(
-                            cfg.get("access_token") or ""
-                        ).strip()
+                        ready = bool(
+                            cfg.get("enabled")
+                            and (self._credential_status.get(tool) or {}).get(
+                                "available"
+                            )
+                        )
                     else:
                         cfg = (self.settings.providers or {}).get(tool) or {}
                         ready = cfg.get("enabled") and str(
@@ -759,15 +779,44 @@ class ProviderSettingsWindowController(NSObject):
             self._alert("无法保存额度设置", "配置文件写入失败，原设置未更改。")
             return
 
-        refreshed = []
-        if changed or auto_refresh_changed:
-            self.core.quota.reload_fetchers(refresh=False)
-        if changed:
-            for tool in ready_tools:
-                self.core.quota.refresh_now(tool)
-                refreshed.append(_NAMES[tool])
         self._reload_controls()
         mode = "已开启周期自动刷新" if auto_refresh_enabled else "之后仅手动刷新"
+        if not changed and not auto_refresh_changed:
+            self._message.setStringValue_(f"配置已保存；没有来源需要刷新；{mode}。")
+            return
+
+        self._message.setStringValue_(f"配置已保存；正在后台应用来源变更；{mode}。")
+
+        def apply_runtime_change():
+            try:
+                self.core.quota.reload_fetchers(refresh=False)
+                refreshed = []
+                for tool in ready_tools:
+                    self.core.quota.refresh_now(tool)
+                    refreshed.append(_NAMES[tool])
+                error = ""
+            except Exception:
+                log.exception("failed to apply saved quota-source settings")
+                refreshed = []
+                error = "配置已保存，但运行时刷新失败；请点“重新检测 / 刷新”重试。"
+            AppHelper.callAfter(
+                self._finish_saved_runtime_change,
+                refreshed,
+                mode,
+                error,
+            )
+
+        threading.Thread(
+            target=apply_runtime_change,
+            name="agentbar-provider-settings-apply",
+            daemon=True,
+        ).start()
+
+    @objc.python_method
+    def _finish_saved_runtime_change(self, refreshed, mode, error):
+        if error:
+            self._message.setStringValue_(error)
+            return
         refresh_note = (
             f"已刷新变更来源：{'、'.join(refreshed)}"
             if refreshed else "没有来源需要刷新"

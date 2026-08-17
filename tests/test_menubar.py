@@ -201,7 +201,9 @@ def test_web_panel_uses_fragment_and_session_storage_for_token_bootstrap():
     assert 'localStorage.removeItem("agentbar_token"' in html
     assert 'localStorage.setItem("agentbar_token"' not in html
     assert ".api_key" not in html
-    assert "access_token" in html
+    assert "access_token" not in html
+    assert "account_id" not in html
+    assert "自动" in html
     assert 'id="btnRefreshQuota"' not in html
     assert "refreshQuotaSource('${name}')" in html
     # Clearing one cookie must not serialize unrelated unsaved form controls.
